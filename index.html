@@ -422,7 +422,7 @@ function stressStep() {
   const k = Math.min((N * N * 0.05) | 0, STRESS_MAX);
   for (let j = 0; j < k; j++) {
     const t = (Math.random() * N * N) | 0;
-    stateData[t] = GRASS0 + (Math.random() * GRASS_N | 0);
+    stateData[t] = (Math.random() * LAYERS) | 0;   // any of the 32 textures -> visible mosaic flicker
   }
   editsThisSec += k;
   stateTex.needsUpdate = true;
