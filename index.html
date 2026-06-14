@@ -138,6 +138,8 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.autoUpdate = false;   // sun + geometry are static -> only re-render the shadow map on edits,
+                                          // not every camera move (else 72 chunk casters redraw every frame)
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -311,6 +313,7 @@ function createWorld(n) {
   }
 
   fillWorld();
+  renderer.shadowMap.needsUpdate = true;   // re-render the static shadow map once for the new props
   updateHudStatic();
 }
 
@@ -443,6 +446,7 @@ function paintRegion(txc, tzc) {
   for (let z = z0; z < z1; z++) for (let x = x0; x < x1; x++) applyTool(x, z);
   stateTex.needsUpdate = true;    // small terrain re-upload
   flushProps();
+  renderer.shadowMap.needsUpdate = true;   // props may have changed -> refresh shadow map (one frame)
 }
 
 // stress: randomize 5% (capped) of terrain tiles every frame — scales because it's a texture write

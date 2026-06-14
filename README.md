@@ -53,7 +53,8 @@ The HUD shows live draw calls, FPS + sparkline, grid/tile counts, live tree/buil
 ## Notes & limits
 
 - **Trees and buildings are 3D; the terrain stays flat** (the requested design).
-- **Frustum culling is per-chunk, not per-instance.** Off-screen *chunks* are culled (the HUD draw-call count drops as you look at less). The shadow pass still draws all chunks (the sun frustum covers the whole map), so turning **shadows off** is the biggest single FPS lever — and the terrain itself is never culled.
+- **Frustum culling is per-chunk, not per-instance.** Off-screen chunks are culled (the HUD draw-call count drops as you look at less); the terrain itself is never culled.
+- **The sun shadow map is static** — `shadowMap.autoUpdate = false`, re-rendered only on edits, not on every camera move. (The sun and geometry don't change when you orbit, so a directional shadow map is camera-independent. Without this, the per-frame shadow render of all 72 prop chunks pins the frame rate regardless of view.)
 - **"120 fps" is vsync-bound.** If a machine shows an oddly low cap (e.g. exactly 30), suspect a power-saver rAF cap, a 30 Hz display mode, or Chrome using the integrated GPU instead of the discrete one (check `chrome://gpu`) — not the workload.
 - The earlier **flat, single-draw-call, no-props** terrain (which scaled to 4096² at 1 draw call) is preserved in git history.
 
