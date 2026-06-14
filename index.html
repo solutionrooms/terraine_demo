@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GPU Tile Grid — one-draw-call city-builder terrain</title>
+<style>
+  :root { --fg:#e7ecf4; --dim:#8b95a7; --ok:#5ad28b; --warn:#ff7a6b; }
+  html, body { margin:0; height:100%; overflow:hidden; background:#10131a; }
+  #app, canvas { display:block; }
+  * { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+
+  /* HUD overlay — must not steal pointer events from the scene (FR-20) */
+  #hud {
+    position:fixed; top:14px; left:14px; z-index:10;
+    pointer-events:none;
+    color:var(--fg);
+    background:rgba(14,18,26,0.72);
+    border:1px solid rgba(255,255,255,0.08);
+    border-radius:10px;
+    padding:12px 14px 10px;
+    width:212px;
+    backdrop-filter:blur(6px);
+    box-shadow:0 8px 28px rgba(0,0,0,0.45);
+    user-select:none;
+  }
+  #hud .title { font-size:11px; letter-spacing:1.5px; color:var(--dim); margin-bottom:8px; }
+  #hud .row { display:flex; justify-content:space-between; font-size:12px; line-height:20px; }
+  #hud .k { color:var(--dim); }
+  #hud .v { color:var(--fg); font-variant-numeric:tabular-nums; }
+  #hud-calls.ok   { color:var(--ok); }
+  #hud-calls.warn { color:var(--warn); }
+  #spark { display:block; width:184px; height:34px; margin:6px 0 8px; }
+  #hud-bench { font-size:11px; color:var(--dim); min-height:14px; margin-top:2px; }
+  .scales { display:flex; gap:5px; margin-top:9px; pointer-events:auto; }
+  .scales button {
+    flex:1; pointer-events:auto;
+    background:rgba(255,255,255,0.06); color:var(--fg);
+    border:1px solid rgba(255,255,255,0.10); border-radius:6px;
+    padding:5px 0; font-size:11px; cursor:pointer;
+  }
+  .scales button:hover { background:rgba(255,255,255,0.14); }
+  .scales button.active { background:var(--ok); color:#06250f; border-color:var(--ok); }
+  .hint { font-size:10.5px; color:var(--dim); margin-top:9px; line-height:15px; }
+
+  #resizing {
+    position:fixed; inset:0; z-index:20; display:none;
+    align-items:center; justify-content:center;
+    background:rgba(8,10,14,0.55); color:var(--fg); font-size:14px; letter-spacing:1px;
+    pointer-events:none;
+  }
+</style>
+
+<!-- 5.1 import map — three pinned at r0.184.0, WebGL2 only -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.184.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.184.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="hud">
+    <div class="title">GPU TILE GRID</div>
+    <div class="row"><span class="k">Draw calls</span><span id="hud-calls" class="v">–</span></div>
+    <div class="row"><span class="k">FPS</span><span id="hud-fps" class="v">–</span></div>
+    <canvas id="spark" width="184" height="34"></canvas>
+    <div class="row"><span class="k">Grid</span><span id="hud-grid" class="v">–</span></div>
+    <div class="row"><span class="k">Tiles</span><span id="hud-tiles" class="v">–</span></div>
+    <div class="row"><span class="k">State VRAM</span><span id="hud-vram" class="v">–</span></div>
+    <div class="row"><span class="k">Hover</span><span id="hud-hover" class="v">–</span></div>
+    <div class="scales">
+      <button data-n="64">64</button>
+      <button data-n="256">256</button>
+      <button data-n="1024">1024</button>
+      <button data-n="2048">2048</button>
+      <button data-n="4096">4096</button>
+    </div>
+    <div id="hud-bench"></div>
+    <div class="hint">click: build / clear road · drag: orbit · scroll: zoom<br>R: reset · 1–5: scale · B: benchmark</div>
+  </div>
+
+  <div id="resizing">resizing…</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ───────────────────────────── constants & state model ─────────────────────────────
+const WORLD = 200;                 // FR-1: world size is CONSTANT across all N
+const HALF  = WORLD / 2;
+const STATE = { GRASS: 0, ROAD: 1, SAND: 2, WATER: 3 };
+const SCALES = [64, 256, 1024, 2048, 4096];
+
+let N = 256;                        // FR-1: default 256
+let cellSize = WORLD / N;
+let data;                          // Uint8Array(N*N) — live state mirror (FR-2)
+let natural;                       // Uint8Array(N*N) — pre-edit terrain (FR-3)
+let stateTex;                      // R8 DataTexture (FR-2)
+
+// ───────────────────────────── renderer / scene / camera ─────────────────────────────
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+const bg = new THREE.Color(0x10131a);
+renderer.setClearColor(bg, 1);
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 4000);
+camera.position.set(WORLD * 0.55, WORLD * 0.62, WORLD * 0.55);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 12;
+controls.maxDistance = 1200;
+controls.maxPolarAngle = Math.PI * 0.49;   // stay above the horizon
+controls.update();
+
+// ───────────────────────────── shader (unlit, GPU-driven) ─────────────────────────────
+// 7.2: every CUSTOM uniform below MUST also be declared in the GLSL or it silently fails (P-3).
+const uniforms = {
+  uState:   { value: null },
+  uN:       { value: N },
+  uOrigin:  { value: new THREE.Vector2(-HALF, -HALF) },   // world-space grid origin
+  uWorld:   { value: WORLD },
+  uHover:   { value: new THREE.Vector2(-1, -1) },         // hovered tile coords, (-1,-1) off-grid
+  uCam:     { value: new THREE.Vector3() },               // updated each frame for fog + line fade
+  uFog:     { value: bg.clone() },
+  uFogNear: { value: WORLD * 0.6 },
+  uFogFar:  { value: WORLD * 2.2 },
+};
+
+const vertexShader = /* glsl */`
+  precision highp float;
+  uniform vec3 uCam;
+  varying vec2 vWorld;
+  varying float vDist;
+  void main() {
+    vec4 wp = modelMatrix * vec4(position, 1.0);
+    vWorld = wp.xz;
+    vDist  = distance(uCam, wp.xyz);
+    gl_Position = projectionMatrix * viewMatrix * wp;
+  }
+`;
+
+const fragmentShader = /* glsl */`
+  precision highp float;
+  uniform sampler2D uState;
+  uniform float uN;
+  uniform vec2  uOrigin;
+  uniform float uWorld;
+  uniform vec2  uHover;
+  uniform vec3  uFog;
+  uniform float uFogNear;
+  uniform float uFogFar;
+  varying vec2  vWorld;
+  varying float vDist;
+
+  // in-shader palette: state byte -> color (FR-6)
+  vec3 palette(float s) {
+    if (s < 0.5) return vec3(0.42, 0.62, 0.28); // GRASS
+    if (s < 1.5) return vec3(0.27, 0.28, 0.31); // ROAD
+    if (s < 2.5) return vec3(0.84, 0.77, 0.52); // SAND
+    return                vec3(0.18, 0.45, 0.70); // WATER
+  }
+
+  void main() {
+    vec2 uv = (vWorld - uOrigin) / uWorld;            // [0,1] across the grid
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) discard;
+
+    vec2 cell = uv * uN;                              // tile space
+    vec2 id   = floor(cell);                          // (tx, tz)
+
+    // sample state at tile centre, NEAREST (FR-6)
+    float s = texture2D(uState, (id + 0.5) / uN).r * 255.0;
+    vec3 col = palette(s);
+
+    // faint per-tile checker so tiles read as tiles (FR-9, ±3%)
+    float chk = mod(id.x + id.y, 2.0);
+    col *= (chk > 0.5) ? 1.03 : 0.97;
+
+    // analytic anti-aliased gridlines via fwidth (FR-7)
+    vec2 f = fract(cell);
+    vec2 d = fwidth(cell);
+    vec2 g = min(f, 1.0 - f) / max(d, vec2(1e-5));
+    float line = 1.0 - clamp(min(g.x, g.y), 0.0, 1.0);
+    // fade lines with distance -> far field reads as solid blocks (avoids moiré)
+    float lineFade = 1.0 - clamp((vDist - uWorld * 0.2) / (uWorld * 1.2), 0.0, 1.0);
+    col = mix(col, vec3(0.05, 0.06, 0.08), line * 0.5 * lineFade);
+
+    // hover highlight — uniform-driven, no upload (FR-16)
+    if (uHover.x >= 0.0 && abs(id.x - uHover.x) < 0.5 && abs(id.y - uHover.y) < 0.5) {
+      col = mix(col, vec3(1.0, 0.95, 0.62), 0.45);
+    }
+
+    // distance fog (FR-8)
+    float fog = clamp((vDist - uFogNear) / (uFogFar - uFogNear), 0.0, 1.0);
+    col = mix(col, uFog, fog);
+
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+const material = new THREE.ShaderMaterial({ uniforms, vertexShader, fragmentShader });
+material.extensions = { derivatives: true };   // P-4: enable fwidth under the GLSL1 path
+
+// FR-5: the ONLY renderable object — one flat quad, frustum culling off.
+const geo  = new THREE.PlaneGeometry(WORLD, WORLD);
+const mesh = new THREE.Mesh(geo, material);
+mesh.rotation.x = -Math.PI / 2;     // lay flat in the XZ plane (normal +Y)
+mesh.frustumCulled = false;
+scene.add(mesh);
+
+// ───────────────────────────── grid state build / fill ─────────────────────────────
+// FR-4: tight typed-array loop, no per-tile objects. Lake + sand ring so >1 state is visible.
+function fillProcedural(arr, n) {
+  const cx = n * 0.5, cz = n * 0.5;
+  const lakeR = n * 0.17;
+  const sandR = lakeR + Math.max(2, n * 0.05);
+  const lakeR2 = lakeR * lakeR, sandR2 = sandR * sandR;
+  for (let z = 0; z < n; z++) {
+    const row = z * n;
+    const dz = z - cz, dz2 = dz * dz;
+    for (let x = 0; x < n; x++) {
+      const dx = x - cx;
+      const r2 = dx * dx + dz2;
+      let s = STATE.GRASS;
+      if (r2 < lakeR2)      s = STATE.WATER;
+      else if (r2 < sandR2) s = STATE.SAND;
+      arr[row + x] = s;
+    }
+  }
+}
+
+// FR-18: the ONLY place large (one-time) allocation happens.
+function createState(n) {
+  N = n;
+  cellSize = WORLD / N;
+  data    = new Uint8Array(n * n);
+  natural = new Uint8Array(n * n);
+  fillProcedural(natural, n);
+  data.set(natural);
+
+  // 7.1: R8 DataTexture, NEAREST, clamp, byte-aligned rows, forced GPU upload.
+  stateTex = new THREE.DataTexture(data, n, n, THREE.RedFormat, THREE.UnsignedByteType);
+  stateTex.magFilter = THREE.NearestFilter;
+  stateTex.minFilter = THREE.NearestFilter;      // P-7: no mipmaps on the index texture
+  stateTex.wrapS = stateTex.wrapT = THREE.ClampToEdgeWrapping;
+  stateTex.unpackAlignment = 1;                   // P-6: R8 rows are byte-packed
+  stateTex.needsUpdate = true;
+  renderer.initTexture(stateTex);                 // force upload so __webglTexture exists for editing
+
+  uniforms.uState.value = stateTex;
+  uniforms.uN.value = N;
+}
+
+// ───────────────────────────── picking (ray vs y=0 plane) ─────────────────────────────
+// 7.4 — all scratch created once, reused forever (AC-5 / P-9).
+const raycaster = new THREE.Raycaster();
+const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const hit = new THREE.Vector3();
+const ndc = new THREE.Vector2();
+
+function tileAt(clientX, clientY) {
+  ndc.set((clientX / window.innerWidth) * 2 - 1, -(clientY / window.innerHeight) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  if (!raycaster.ray.intersectPlane(plane, hit)) return null;
+  const tx = Math.floor((hit.x + HALF) / WORLD * N);
+  const tz = Math.floor((hit.z + HALF) / WORLD * N);
+  if (tx < 0 || tz < 0 || tx >= N || tz >= N) return null;
+  hoverScratch.tx = tx; hoverScratch.tz = tz;     // reused object, no per-call alloc
+  return hoverScratch;
+}
+const hoverScratch = { tx: -1, tz: -1 };
+
+// ───────────────────────────── editing (single-texel upload) ─────────────────────────────
+// 7.3 — O(1) GPU edit, one reused scratch byte, no scene rebuild (FR-11/12, AC-4).
+const oneByte = new Uint8Array(1);
+const gl = renderer.getContext();
+const texHandle = () => renderer.properties.get(stateTex).__webglTexture;
+
+function editTile(tx, tz, value) {
+  if (tx < 0 || tz < 0 || tx >= N || tz >= N) return;
+  data[tz * N + tx] = value;                       // keep CPU mirror in sync
+  oneByte[0] = value;
+  gl.bindTexture(gl.TEXTURE_2D, texHandle());
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, tx, tz, 1, 1, gl.RED, gl.UNSIGNED_BYTE, oneByte);
+  renderer.resetState();                            // P-5: re-sync three's cached GL state
+}
+
+function toggleTile(tx, tz) {
+  const i = tz * N + tx;
+  // FR-10: ROAD <-> the natural tile underneath (don't lose lakes/sand)
+  editTile(tx, tz, data[i] === STATE.ROAD ? natural[i] : STATE.ROAD);
+}
+
+function resetAll() {
+  data.set(natural);
+  stateTex.needsUpdate = true;                      // FR-13: full re-upload OK for a one-shot reset
+}
+
+// ───────────────────────────── pointer: click vs orbit-drag ─────────────────────────────
+let downX = 0, downY = 0, moved = false;
+const DRAG_PX = 5;                                  // FR-15
+const dom = renderer.domElement;
+
+dom.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  downX = e.clientX; downY = e.clientY; moved = false;
+});
+dom.addEventListener('pointermove', (e) => {
+  if (Math.abs(e.clientX - downX) > DRAG_PX || Math.abs(e.clientY - downY) > DRAG_PX) moved = true;
+  const t = tileAt(e.clientX, e.clientY);           // FR-16: hover = uniform write only
+  if (t) uniforms.uHover.value.set(t.tx, t.tz);
+  else   uniforms.uHover.value.set(-1, -1);
+});
+dom.addEventListener('pointerup', (e) => {
+  if (e.button !== 0 || moved) return;              // a drag was an orbit, not an edit
+  const t = tileAt(e.clientX, e.clientY);
+  if (t) toggleTile(t.tx, t.tz);
+});
+dom.addEventListener('pointerleave', () => uniforms.uHover.value.set(-1, -1));
+
+// ───────────────────────────── scale switching ─────────────────────────────
+const resizingEl = document.getElementById('resizing');
+function setScale(n) {
+  if (n === N) return;
+  resizingEl.style.display = 'flex';
+  // defer two frames so the "resizing…" overlay actually paints before the big fill
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const old = stateTex;
+    createState(n);                  // FR-18: realloc arrays + texture, update uniforms
+    old.dispose();                   // dispose the previous GPU texture
+    syncScaleButtons();
+    updateHudStatic();
+    resizingEl.style.display = 'none';
+  }));
+}
+
+document.querySelectorAll('.scales button').forEach((b) => {
+  b.addEventListener('click', () => setScale(+b.dataset.n));
+});
+function syncScaleButtons() {
+  document.querySelectorAll('.scales button').forEach((b) => {
+    b.classList.toggle('active', +b.dataset.n === N);
+  });
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.key >= '1' && e.key <= '5') setScale(SCALES[+e.key - 1]);   // FR-17
+  else if (e.key === 'r' || e.key === 'R') resetAll();
+  else if (e.key === 'b' || e.key === 'B') runBenchmark();
+});
+
+// ───────────────────────────── HUD / telemetry ─────────────────────────────
+const elCalls = document.getElementById('hud-calls');
+const elFps   = document.getElementById('hud-fps');
+const elGrid  = document.getElementById('hud-grid');
+const elTiles = document.getElementById('hud-tiles');
+const elVram  = document.getElementById('hud-vram');
+const elHover = document.getElementById('hud-hover');
+const elBench = document.getElementById('hud-bench');
+
+const spark = document.getElementById('spark');
+const sctx  = spark.getContext('2d');
+const ftHist = new Float32Array(spark.width);       // preallocated frame-time ring (no per-frame alloc)
+let ftIdx = 0;
+
+function fmtBytes(b) {
+  if (b >= 1048576) return (b / 1048576).toFixed(2) + ' MB';
+  if (b >= 1024)    return (b / 1024).toFixed(1) + ' KB';
+  return b + ' B';
+}
+function updateHudStatic() {                         // FR-19: grid / tiles / VRAM
+  elGrid.textContent  = N + '×' + N;
+  elTiles.textContent = (N * N).toLocaleString();
+  elVram.textContent  = fmtBytes(N * N);             // R8 = 1 byte/tile
+}
+
+function drawSpark() {
+  const w = spark.width, h = spark.height;
+  sctx.clearRect(0, 0, w, h);
+  // 8.33 ms target line (120 Hz budget)
+  const ty = h - Math.min(8.33 / 33.3, 1) * h;
+  sctx.strokeStyle = 'rgba(90,210,139,0.35)';
+  sctx.beginPath(); sctx.moveTo(0, ty); sctx.lineTo(w, ty); sctx.stroke();
+  // frame-time trace, scaled 0..33ms
+  sctx.strokeStyle = '#7fb2ff';
+  sctx.lineWidth = 1;
+  sctx.beginPath();
+  for (let i = 0; i < w; i++) {
+    const ms = ftHist[(ftIdx + i) % w];
+    const y = h - Math.min(ms / 33.3, 1) * h;
+    if (i === 0) sctx.moveTo(i, y); else sctx.lineTo(i, y);
+  }
+  sctx.stroke();
+}
+
+// ───────────────────────────── benchmark (outside vsync) ─────────────────────────────
+function runBenchmark() {                            // FR-21
+  const M = 200;
+  const t0 = performance.now();
+  for (let i = 0; i < M; i++) renderer.render(scene, camera);
+  const ms = (performance.now() - t0) / M;
+  elBench.textContent = `bench: ${ms.toFixed(3)} ms/frame · ${(1000 / ms).toFixed(0)} fps headroom`;
+}
+
+// ───────────────────────────── render loop ─────────────────────────────
+let prev = performance.now();
+let fpsSmooth = 0;
+let hudAccum = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = now - prev; prev = now;
+
+  controls.update();
+  uniforms.uCam.value.copy(camera.position);        // reused vector, no alloc (AC-5)
+  renderer.render(scene, camera);
+
+  const calls = renderer.info.render.calls;         // read POST-render (FR-19)
+
+  // sparkline every frame (canvas only, adds 0 WebGL draw calls)
+  ftHist[ftIdx] = dt; ftIdx = (ftIdx + 1) % spark.width;
+  drawSpark();
+
+  // throttle text/DOM updates to ~5 Hz to keep the hot loop allocation-light
+  fpsSmooth = fpsSmooth ? fpsSmooth * 0.9 + (1000 / dt) * 0.1 : 1000 / dt;
+  hudAccum += dt;
+  if (hudAccum >= 200) {
+    hudAccum = 0;
+    elCalls.textContent = calls;
+    elCalls.className = 'v ' + (calls === 1 ? 'ok' : 'warn');
+    elFps.textContent = fpsSmooth.toFixed(0);
+    const h = uniforms.uHover.value;
+    elHover.textContent = h.x >= 0 ? `${h.x | 0}, ${h.y | 0}` : '—';
+  }
+}
+
+// ───────────────────────────── window resize ─────────────────────────────
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ───────────────────────────── boot ─────────────────────────────
+createState(N);
+syncScaleButtons();
+updateHudStatic();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
