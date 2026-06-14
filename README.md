@@ -1,46 +1,53 @@
-# GPU Tile Grid — one-draw-call city-builder terrain (POC)
+# GPU City — flat textured tile grid + 3D instanced props (realtime)
 
-A flat, editable N×N tile grid that renders in **exactly one draw call** and whose
-render cost is **independent of tile count** — the same code draws a 64×64 grid and a
-4096×4096 (16.7M-tile) grid at the same cost.
+A low-poly city renderer in a single self-contained `index.html` (Three.js r0.184, WebGL2):
 
-It does this with **Tier 3** of the scaling model (spec §4.2): the grid is a **single
-quad**, per-tile *state* lives in an **R8 `DataTexture`** (1 byte/tile), and a
-`ShaderMaterial` fragment shader maps each pixel → tile → state → color. There are **no
-per-tile JS objects** anywhere — that's the whole point ("rendering on GPU", and "JS
-object allocation is the slow part"). Editing a tile uploads a **single texel**; picking
-is **ray vs. the y=0 plane**, so both are O(1).
+- **Flat terrain grid**, tiles drawn from a **32-texture atlas** (a `DataArrayTexture` / `sampler2DArray`), sampled per tile in the terrain shader.
+- **3D trees** (~500-poly low-poly model) on ~**10%** of tiles, and **3D buildings** of varied height — both `InstancedMesh` layers.
+- **Distant-sun `DirectionalLight` with cast shadows** + a hemisphere sky/ground ambient.
+- **Realtime editing** and a **stress test that randomizes 5% of all tiles every frame**.
+
+It renders in **3 draw calls** (terrain + trees + buildings), and that stays constant regardless of grid size, number of trees/buildings, or edit rate — comfortably under the ~100 budget.
+
+## The key idea: one state texture drives everything
+
+There are **no per-tile or per-prop JS objects**. A single **RGBA8 state texture** is the source of truth:
+
+| channel | meaning |
+|---|---|
+| **R** | terrain texture index (0–31) → which atlas layer the tile shows |
+| **G** | prop type (0 none, 1 tree, 2 building) |
+| **B** | per-tile variant (tree rotation/scale, building height) |
+
+- The **terrain** quad samples R → texture array layer.
+- The **trees** and **buildings** are full-grid `InstancedMesh` layers (one instance per tile). Each instance's **placement and visibility are computed in the vertex shader** by reading its tile's state: non-matching instances collapse to a degenerate point (and a matching `customDepthMaterial` keeps shadows correct).
+
+**So editing anything — including the 5%/frame stress test — is just a texture write. No instance buffers are ever rebuilt**, which is exactly why mass realtime edits stay cheap (this was the whole point: JS object churn was the bottleneck to avoid).
 
 ## Run
 
-ES modules + an import map require HTTP — browsers block module scripts on `file://`,
-so you must serve the folder (you can't double-click `index.html`):
+ES modules + a CDN import map require HTTP — serve the folder (you can't open `index.html` from `file://`):
 
 ```bash
 npm run serve          # python3 -m http.server 8080
 # then open http://localhost:8080/
 ```
 
-Any static server works (`npx serve`, `php -S`, etc.). No build step, no bundler.
-Three.js is loaded from a pinned CDN (`three@0.184.0`) via the import map in `index.html`.
+No build step. Three.js is pinned to `three@0.184.0` via the import map in `index.html`.
 
 ## Test (headless, no GPU)
 
 ```bash
-npm install            # fetches three@0.184.0 as a devDependency (test only)
+npm install            # three@0.184.0 as a devDependency (test only)
 npm test               # node test/drawcall.test.mjs
 ```
 
-Asserts `renderer.info.render.calls === 1` for N ∈ {64, 4096} against a stubbed WebGL2
-context (spec §9.1 / AC-7). `render.calls` is incremented by three in JS, not the GPU,
-so the count is exactly what a browser reports. Exits non-zero if any count ≠ 1.
-
-Expected output:
+Builds the real scene structure (terrain plane + two `InstancedMesh` of N² each + a shadow-casting sun) against a stubbed WebGL2 context and asserts the **main-pass draw-call count is bounded (< 100) and identical for N = 64 and N = 256** — i.e. independent of tile count. Expected output:
 
 ```
-grid 64  x64   tiles      4096  ->  draw calls = 1   (R8 state tex = 4.0 KB)  OK
-grid 4096x4096 tiles  16777216  ->  draw calls = 1   (R8 state tex = 16.00 MB)  OK
-PASS: every scale renders the terrain in exactly 1 draw call.
+grid 64   (  4096 tiles,    8192 prop instances)  ->  main-pass draw calls = 3  OK
+grid 256  ( 65536 tiles,  131072 prop instances)  ->  main-pass draw calls = 3  OK
+PASS: draw calls are bounded and independent of tile count.
 ```
 
 ## Controls
@@ -48,54 +55,25 @@ PASS: every scale renders the terrain in exactly 1 draw call.
 | Input | Action |
 |-------|--------|
 | **Left-click** | Paint the selected tool over a brush-sized square |
-| **BUILD** buttons | Choose what to paint: Road / Building / Tree / Water / Clear (bulldoze → natural) |
-| **BRUSH** buttons | Choose the footprint: 1×1 / 4×4 / 16×16 tiles |
-| **Drag** | Rotate the camera (a drag > 5 px is never treated as a click) |
-| **Arrow keys** | Pan the camera across the map |
-| **Z / X** | Zoom in / out (mouse scroll also zooms) |
-| **1–5** or HUD buttons | Switch grid scale: 64 / 256 / 1024 / 2048 / 4096 |
-| **R** | Reset all tiles to the natural terrain |
-| **B** | Benchmark — render N frames outside vsync, report ms/frame headroom |
+| **BUILD** buttons | Tree / Bldg / Road / Grass / Water / Clear (Clear removes the prop) |
+| **BRUSH** buttons | Footprint: 1×1 / 4×4 / 16×16 tiles |
+| **STRESS** button (or **S**) | Toggle: randomize 5% of all tiles every frame |
+| **Drag** | Rotate · **Arrow keys** Pan · **Z / X** or scroll Zoom |
+| **1–3** | Grid size 64 / 128 / 256 |
 
-**Build palette (flat).** Pick a tool and brush size in the HUD, then click to paint that
-square. Buildings and trees are **flat top-down glyphs** drawn per-tile in the fragment
-shader (a roofed footprint; a round canopy) — they're just extra tile *states* in the same
-R8 texture, so the whole map still renders in **one draw call**, and a click uploads only
-the painted brush rectangle via `texSubImage2D` (1–256 texels, one reused scratch buffer).
-This is intentionally the flat texture-state approach (the user asked for flat), **not** the
-3D `InstancedMesh` building layer sketched in spec §11 — that remains future work.
+The HUD shows live draw calls (green while < 100), FPS + frame-time sparkline, grid/tile counts, tree-instance capacity, and **edits/sec** (which the stress test drives into the millions).
 
-The HUD (top-left) shows live **draw calls** (green when 1), **FPS** + a frame-time
-sparkline (with the 8.33 ms / 120 Hz budget line), **grid size**, **tile count**,
-**state VRAM** (= N·N bytes), and the **hovered tile**.
+## Notes & limits
 
-## In-browser checks (spec §9.2)
-
-- HUD draw-calls reads **1** while orbiting and after editing.
-- Cycling N 64→4096 keeps draw-calls at 1 and FPS roughly flat (scale-independence).
-- A click lands on the exact tile under the cursor even at a steep oblique angle.
-- Chrome DevTools allocation profiler shows no per-frame garbage while idle / orbiting /
-  hovering (the render loop only copies a reused vector; HUD text is throttled to ~5 Hz).
-
-## Known limits
-
-- **Flat grid — no relief, no shadows.** A flat quad has uniform up-normals and nothing
-  to self-shadow; lighting would be a constant factor and a shadow map is a *second*
-  render pass that would break the one-draw-call invariant. Colors + analytic AA
-  gridlines + distance fog carry the look (spec §4.3). **Adding height means leaving this
-  tier** (per-instance/geometry height), which is a different architecture.
-- **Far-field shimmer at high N** (spec P-7): the state texture is sampled NEAREST with no
-  mipmaps (you must never mipmap an *index* texture — averaging state enums yields
-  garbage), so at 4096² many tiles fall under one pixel. The gridlines fade with distance
-  to mask it. A proper fix (mip-mapped *color* LODs or screen-space supersampling) is
-  future work.
-- **"120 fps" is vsync-bound.** `requestAnimationFrame` caps at the display refresh; use
-  **B** (benchmark mode) to measure true headroom above vsync.
+- **Trees and buildings are 3D; the terrain stays flat** (this is the requested design). The flat terrain keeps the grid editable and the ground at ~1 draw call; the props are real geometry with height and shadows.
+- **Scale ceiling.** Props use *full-grid* instancing (one instance per tile, GPU-culled to the ~10% that are visible) so that any tile can become a prop in realtime with zero buffer rebuilds. The cost is per-tile vertex work, so grid size is capped at **256** here (vs the millions of tiles the flat-only version reached). Switching grid rebuilds the instanced layers once.
+- **"120 fps" is vsync-bound** — `requestAnimationFrame` caps at the display refresh.
+- The earlier **flat, single-draw-call** version (no 3D props/lighting) is preserved in git history if you want the scale-independent terrain-only baseline.
 
 ## Files
 
 ```
 index.html                 self-contained app (import map + HUD + all logic/shaders inline)
-test/drawcall.test.mjs     headless one-draw-call verification (no GPU)
+test/drawcall.test.mjs     headless draw-call test (bounded & tile-count-independent)
 package.json               npm test + serve scripts; three@0.184.0 devDependency
 ```

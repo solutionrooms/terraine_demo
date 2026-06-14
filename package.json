@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "One-draw-call GPU tile grid — terrain foundation for a low-poly city builder (POC).",
+  "description": "GPU city — flat 32-texture tile grid + 3D instanced trees/buildings + sun shadows, realtime-editable (POC).",
   "scripts": {
     "serve": "python3 -m http.server 8080",
     "test": "node test/drawcall.test.mjs"

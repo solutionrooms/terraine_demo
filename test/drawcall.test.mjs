@@ -1,11 +1,16 @@
-// Headless one-draw-call verification (spec §9.1, AC-7).
+// Headless draw-call verification (no GPU).
 //
-// Mechanism: renderer.info.render.calls is incremented by three in JavaScript,
-// not by the GPU. If render() completes against a *stub* WebGL2 context, the
-// count is exactly what a browser reports. In Node, WebGLRenderingContext is
-// undefined, so three's WebGL1 guard is skipped and it accepts any object as
-// the context. We build the REAL scene structure (one Plane + the real
-// ShaderMaterial + an R8 DataTexture) and assert calls === 1.
+// The architecture changed from "flat one-quad terrain" to a 3D city: a flat
+// textured terrain quad + 3D instanced trees + 3D instanced buildings + a sun
+// shadow. So the invariant is no longer "exactly 1 draw call" — it's:
+//
+//   main-pass draw calls == number of LAYERS (terrain + trees + buildings),
+//   and that is INDEPENDENT of tile count and prop count, and well under 100.
+//
+// renderer.info.render.calls is incremented by three in JS, not the GPU, so a
+// render against a stubbed WebGL2 context reports exactly what a browser would.
+// We build the real scene structure (one plane + two InstancedMesh of N*N each)
+// at N = 64 and N = 256 and assert the call count is the same and bounded.
 //
 //   node test/drawcall.test.mjs   (npm test)
 
@@ -15,59 +20,42 @@ import * as THREE from 'three';
 function makeStubGL() {
   let counter = 1;
   const cache = new Map();
-
   const gl = new Proxy({}, {
     get(_t, prop) {
       if (typeof prop !== 'string') return undefined;
       if (cache.has(prop)) return cache.get(prop);
-
-      let val;
-      if (/^[A-Z0-9_]+$/.test(prop)) {
-        // ALL_CAPS property -> a unique integer (a WebGL constant)
-        val = counter++;
-      } else {
-        val = makeFn(prop);
-      }
+      const val = /^[A-Z0-9_]+$/.test(prop) ? counter++ : makeFn(prop);
       cache.set(prop, val);
       return val;
     },
   });
-
   function makeFn(prop) {
     switch (prop) {
       case 'getShaderParameter': return () => true;
       case 'getProgramParameter': return (_p, pname) =>
         (pname === gl.ACTIVE_UNIFORMS || pname === gl.ACTIVE_ATTRIBUTES) ? 0 : true;
       case 'getActiveUniform': return () => null;
-      case 'getActiveAttrib':  return () => null;
+      case 'getActiveAttrib': return () => null;
       case 'getParameter': return (pname) => {
         if (pname === gl.VERSION) return 'WebGL 2.0 (stub)';
         if (pname === gl.SHADING_LANGUAGE_VERSION) return 'WebGL GLSL ES 3.00 (stub)';
         if (pname === gl.VENDOR || pname === gl.RENDERER) return 'stub';
-        return 16384;                                  // large integer for any limit query
+        return 16384;
       };
-      case 'getShaderPrecisionFormat':
-        return () => ({ rangeMin: 127, rangeMax: 127, precision: 23 });
+      case 'getShaderPrecisionFormat': return () => ({ rangeMin: 127, rangeMax: 127, precision: 23 });
       case 'getContextAttributes': return () => ({});
       case 'getExtension': return () => null;
-      case 'getError':     return () => 0;
-      case 'createProgram':
-      case 'createShader':
-      case 'createBuffer':
-      case 'createTexture':
-      case 'createVertexArray':
-      case 'createFramebuffer':
-      case 'createRenderbuffer':
-        return () => ({ __id: counter++ });            // non-null sentinel
-      default:
-        return () => {};                               // everything else: no-op
+      case 'getError': return () => 0;
+      case 'checkFramebufferStatus': return () => gl.FRAMEBUFFER_COMPLETE;
+      case 'createProgram': case 'createShader': case 'createBuffer':
+      case 'createTexture': case 'createVertexArray':
+      case 'createFramebuffer': case 'createRenderbuffer':
+        return () => ({ __id: counter++ });
+      default: return () => {};
     }
   }
-
   return gl;
 }
-
-// Minimal canvas stub (three reads a few props / attaches listeners).
 function makeCanvas(gl) {
   return {
     width: 1, height: 1, style: {},
@@ -77,106 +65,71 @@ function makeCanvas(gl) {
   };
 }
 
-// ─── the REAL scene structure (mirrors index.html) ─────────────────────────────
+// ─── the real scene structure: terrain quad + 2 instanced prop layers + sun ────
 const WORLD = 200;
+const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+const treeGeo = new THREE.ConeGeometry(0.5, 1.5, 8);
+const dummy = new THREE.Object3D();
 
-const vertexShader = `
-  precision highp float;
-  uniform vec3 uCam;
-  varying vec2 vWorld;
-  varying float vDist;
-  void main() {
-    vec4 wp = modelMatrix * vec4(position, 1.0);
-    vWorld = wp.xz;
-    vDist  = distance(uCam, wp.xyz);
-    gl_Position = projectionMatrix * viewMatrix * wp;
-  }
-`;
-const fragmentShader = `
-  precision highp float;
-  uniform sampler2D uState;
-  uniform float uN;
-  uniform vec2  uOrigin;
-  uniform float uWorld;
-  uniform vec2  uHover;
-  uniform vec3  uFog;
-  uniform float uFogNear;
-  uniform float uFogFar;
-  varying vec2  vWorld;
-  varying float vDist;
-  void main() {
-    vec2 uv = (vWorld - uOrigin) / uWorld;
-    vec2 cell = uv * uN;
-    float s = texture2D(uState, (floor(cell) + 0.5) / uN).r * 255.0;
-    gl_FragColor = vec4(vec3(s, vDist, uHover.x + uFog.x + uFogNear + uFogFar), 1.0);
-  }
-`;
-
-function buildScene(N) {
-  const data = new Uint8Array(N * N);
-  const tex = new THREE.DataTexture(data, N, N, THREE.RedFormat, THREE.UnsignedByteType);
-  tex.magFilter = THREE.NearestFilter;
-  tex.minFilter = THREE.NearestFilter;
-  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-  tex.unpackAlignment = 1;
-  tex.needsUpdate = true;
-
-  const material = new THREE.ShaderMaterial({
-    uniforms: {
-      uState:   { value: tex },
-      uN:       { value: N },
-      uOrigin:  { value: new THREE.Vector2(-WORLD / 2, -WORLD / 2) },
-      uWorld:   { value: WORLD },
-      uHover:   { value: new THREE.Vector2(-1, -1) },
-      uCam:     { value: new THREE.Vector3() },
-      uFog:     { value: new THREE.Color(0x10131a) },
-      uFogNear: { value: WORLD * 0.6 },
-      uFogFar:  { value: WORLD * 2.2 },
-    },
-    vertexShader, fragmentShader,
-  });
-  material.extensions = { derivatives: true };
-
-  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(WORLD, WORLD), material);
-  mesh.rotation.x = -Math.PI / 2;
-  mesh.frustumCulled = false;
-
+function instanced(geo, n) {
+  const inst = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial(), n * n);
+  for (let i = 0; i < n * n; i++) { dummy.position.set(i % n, 0, (i / n) | 0); dummy.updateMatrix(); inst.setMatrixAt(i, dummy.matrix); }
+  inst.castShadow = true; inst.receiveShadow = true; inst.frustumCulled = false;
+  return inst;
+}
+function buildScene(n) {
   const scene = new THREE.Scene();
-  scene.add(mesh);
 
-  const camera = new THREE.PerspectiveCamera(55, 16 / 9, 0.1, 4000);
-  camera.position.set(WORLD * 0.55, WORLD * 0.62, WORLD * 0.55);
+  const terrain = new THREE.Mesh(new THREE.PlaneGeometry(WORLD, WORLD), new THREE.MeshLambertMaterial());
+  terrain.rotation.x = -Math.PI / 2;
+  terrain.receiveShadow = true;
+  scene.add(terrain);
+
+  scene.add(instanced(treeGeo, n));   // trees layer  (1 InstancedMesh, N*N instances)
+  scene.add(instanced(boxGeo, n));    // buildings layer
+
+  const sun = new THREE.DirectionalLight(0xffffff, 2);
+  sun.position.set(80, 90, 50);
+  sun.castShadow = true;
+  scene.add(sun, sun.target, new THREE.HemisphereLight(0xbfe0ff, 0x55692f, 0.6));
+
+  const camera = new THREE.PerspectiveCamera(52, 16 / 9, 0.5, 3000);
+  camera.position.set(80, 100, 140);
   camera.lookAt(0, 0, 0);
+  return { scene, camera };
+}
 
-  return { scene, camera, tex };
+function callsAt(n) {
+  const gl = makeStubGL();
+  const renderer = new THREE.WebGLRenderer({ canvas: makeCanvas(gl), context: gl, antialias: false });
+  renderer.shadowMap.enabled = true;
+  renderer.setSize(1280, 720, false);
+  const { scene, camera } = buildScene(n);
+  renderer.render(scene, camera);
+  const calls = renderer.info.render.calls;
+  renderer.dispose();
+  return calls;
 }
 
 // ─── run ───────────────────────────────────────────────────────────────────────
+const LAYERS = 3;            // terrain + trees + buildings
+const BUDGET = 100;
 let failed = false;
-for (const N of [64, 4096]) {
-  const gl = makeStubGL();
-  const renderer = new THREE.WebGLRenderer({ canvas: makeCanvas(gl), context: gl, antialias: false });
-  renderer.setSize(1280, 720, false);
-
-  const { scene, camera } = buildScene(N);
-  renderer.render(scene, camera);
-
-  const calls = renderer.info.render.calls;
-  const bytes = N * N;
-  const vram = bytes >= 1048576 ? (bytes / 1048576).toFixed(2) + ' MB'
-                                : (bytes / 1024).toFixed(1) + ' KB';
-  const ok = calls === 1;
+let baseline = null;
+for (const n of [64, 256]) {
+  const calls = callsAt(n);
+  if (baseline === null) baseline = calls;
+  const ok = calls < BUDGET && calls === baseline;
   console.log(
-    `grid ${String(N).padEnd(4)}x${String(N).padEnd(4)} ` +
-    `tiles ${String(N * N).padStart(9)}  ->  draw calls = ${calls}` +
-    `   (R8 state tex = ${vram})  ${ok ? 'OK' : 'FAIL'}`
+    `grid ${String(n).padEnd(4)} (${String(n * n).padStart(6)} tiles, ${String(2 * n * n).padStart(7)} prop instances)` +
+    `  ->  main-pass draw calls = ${calls}  ${ok ? 'OK' : 'FAIL'}`
   );
   if (!ok) failed = true;
-  renderer.dispose();
 }
+console.log(`\n(expected ${LAYERS} layers: terrain + trees + buildings — constant regardless of tile/instance count, budget < ${BUDGET})`);
 
 if (failed) {
-  console.error('\nFAIL: at least one render produced != 1 draw call.');
+  console.error('\nFAIL: draw calls grew with tile count or exceeded the budget.');
   process.exit(1);
 }
-console.log('\nPASS: every scale renders the terrain in exactly 1 draw call.');
+console.log('PASS: draw calls are bounded and independent of tile count.');

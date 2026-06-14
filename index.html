@@ -3,65 +3,44 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>GPU Tile Grid — one-draw-call city-builder terrain</title>
+<title>GPU City — flat tile grid + 3D instanced props (realtime)</title>
 <style>
-  :root { --fg:#e7ecf4; --dim:#8b95a7; --ok:#5ad28b; --warn:#ff7a6b; }
-  html, body { margin:0; height:100%; overflow:hidden; background:#10131a; }
-  #app, canvas { display:block; }
+  :root { --fg:#eaf0f8; --dim:#92a0b6; --ok:#5ad28b; --warn:#ffb03a; }
+  html, body { margin:0; height:100%; overflow:hidden; background:#9fc6e8; }
+  canvas { display:block; }
   * { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 
-  /* HUD overlay — must not steal pointer events from the scene (FR-20) */
   #hud {
-    position:fixed; top:14px; left:14px; z-index:10;
-    pointer-events:none;
-    color:var(--fg);
-    background:rgba(14,18,26,0.72);
-    border:1px solid rgba(255,255,255,0.08);
-    border-radius:10px;
-    padding:12px 14px 10px;
-    width:212px;
-    backdrop-filter:blur(6px);
-    box-shadow:0 8px 28px rgba(0,0,0,0.45);
-    user-select:none;
+    position:fixed; top:14px; left:14px; z-index:10; pointer-events:none;
+    color:var(--fg); background:rgba(14,20,30,0.74);
+    border:1px solid rgba(255,255,255,0.10); border-radius:10px;
+    padding:12px 14px 10px; width:220px;
+    backdrop-filter:blur(6px); box-shadow:0 8px 28px rgba(0,0,0,0.45); user-select:none;
   }
-  #hud .title { font-size:11px; letter-spacing:1.5px; color:var(--dim); margin-bottom:8px; }
+  #hud .title { font-size:11px; letter-spacing:1.4px; color:var(--dim); margin-bottom:8px; }
   #hud .row { display:flex; justify-content:space-between; font-size:12px; line-height:20px; }
   #hud .k { color:var(--dim); }
   #hud .v { color:var(--fg); font-variant-numeric:tabular-nums; }
-  #hud-calls.ok   { color:var(--ok); }
-  #hud-calls.warn { color:var(--warn); }
-  #spark { display:block; width:184px; height:34px; margin:6px 0 8px; }
-  #hud-bench { font-size:11px; color:var(--dim); min-height:14px; margin-top:2px; }
-  .scales { display:flex; gap:5px; margin-top:9px; pointer-events:auto; }
-  .scales button {
-    flex:1; pointer-events:auto;
-    background:rgba(255,255,255,0.06); color:var(--fg);
-    border:1px solid rgba(255,255,255,0.10); border-radius:6px;
-    padding:5px 0; font-size:11px; cursor:pointer;
-  }
-  .scales button:hover { background:rgba(255,255,255,0.14); }
-  .scales button.active { background:var(--ok); color:#06250f; border-color:var(--ok); }
+  #hud-calls.ok { color:var(--ok); } #hud-calls.warn { color:var(--warn); }
+  #spark { display:block; width:192px; height:32px; margin:6px 0 4px; }
   .grp-label { font-size:10px; letter-spacing:1.2px; color:var(--dim); margin-top:11px; }
-  .tools, .brush { display:flex; gap:5px; margin-top:5px; pointer-events:auto; }
-  .tools button, .brush button {
-    flex:1; pointer-events:auto;
+  .btns { display:flex; gap:5px; margin-top:5px; pointer-events:auto; flex-wrap:wrap; }
+  .btns button {
+    flex:1 1 0; min-width:32px; pointer-events:auto;
     background:rgba(255,255,255,0.06); color:var(--fg);
     border:1px solid rgba(255,255,255,0.10); border-radius:6px;
     padding:5px 0; font-size:10.5px; cursor:pointer;
   }
-  .tools button:hover, .brush button:hover { background:rgba(255,255,255,0.14); }
-  .tools button.active, .brush button.active { background:var(--ok); color:#06250f; border-color:var(--ok); }
-  .hint { font-size:10.5px; color:var(--dim); margin-top:9px; line-height:15px; }
-
-  #resizing {
-    position:fixed; inset:0; z-index:20; display:none;
-    align-items:center; justify-content:center;
-    background:rgba(8,10,14,0.55); color:var(--fg); font-size:14px; letter-spacing:1px;
-    pointer-events:none;
+  .btns button:hover { background:rgba(255,255,255,0.15); }
+  .btns button.active { background:var(--ok); color:#06250f; border-color:var(--ok); }
+  #stressBtn.on { background:var(--warn); color:#3a2400; border-color:var(--warn); }
+  .hint { font-size:10.5px; color:var(--dim); margin-top:10px; line-height:15px; }
+  #loading {
+    position:fixed; inset:0; z-index:20; display:flex; align-items:center; justify-content:center;
+    background:rgba(8,12,18,0.6); color:#fff; font-size:14px; letter-spacing:1px; pointer-events:none;
   }
 </style>
 
-<!-- 5.1 import map — three pinned at r0.184.0, WebGL2 only -->
 <script type="importmap">
 {
   "imports": {
@@ -72,498 +51,534 @@
 </script>
 </head>
 <body>
-  <div id="app"></div>
-
   <div id="hud">
-    <div class="title">GPU TILE GRID</div>
+    <div class="title">GPU CITY · FLAT GRID + 3D PROPS</div>
     <div class="row"><span class="k">Draw calls</span><span id="hud-calls" class="v">–</span></div>
     <div class="row"><span class="k">FPS</span><span id="hud-fps" class="v">–</span></div>
-    <canvas id="spark" width="184" height="34"></canvas>
+    <canvas id="spark" width="192" height="32"></canvas>
     <div class="row"><span class="k">Grid</span><span id="hud-grid" class="v">–</span></div>
     <div class="row"><span class="k">Tiles</span><span id="hud-tiles" class="v">–</span></div>
-    <div class="row"><span class="k">State VRAM</span><span id="hud-vram" class="v">–</span></div>
-    <div class="row"><span class="k">Hover</span><span id="hud-hover" class="v">–</span></div>
-    <div class="row"><span class="k">Tool</span><span id="hud-tool" class="v">Road · 1×1</span></div>
+    <div class="row"><span class="k">Tree instances</span><span id="hud-trees" class="v">–</span></div>
+    <div class="row"><span class="k">Edits / s</span><span id="hud-edits" class="v">–</span></div>
+    <div class="row"><span class="k">Tool</span><span id="hud-tool" class="v">Tree · 1×1</span></div>
+
     <div class="grp-label">BUILD</div>
-    <div class="tools">
-      <button data-tool="1">Road</button>
-      <button data-tool="4">Bldg</button>
-      <button data-tool="5">Tree</button>
-      <button data-tool="3">Water</button>
-      <button data-tool="-1">Clear</button>
+    <div class="btns" id="tools">
+      <button data-tool="tree">Tree</button>
+      <button data-tool="bldg">Bldg</button>
+      <button data-tool="road">Road</button>
+      <button data-tool="grass">Grass</button>
+      <button data-tool="water">Water</button>
+      <button data-tool="clear">Clear</button>
     </div>
     <div class="grp-label">BRUSH</div>
-    <div class="brush">
+    <div class="btns" id="brushes">
       <button data-brush="1">1×1</button>
       <button data-brush="4">4×4</button>
       <button data-brush="16">16×16</button>
     </div>
-    <div class="grp-label">SCALE</div>
-    <div class="scales">
+    <div class="grp-label">GRID</div>
+    <div class="btns" id="scales">
       <button data-n="64">64</button>
+      <button data-n="128">128</button>
       <button data-n="256">256</button>
-      <button data-n="1024">1024</button>
-      <button data-n="2048">2048</button>
-      <button data-n="4096">4096</button>
     </div>
-    <div id="hud-bench"></div>
-    <div class="hint">pick a tool + size, click to paint · drag: rotate<br>arrows: pan · Z/X: zoom · 1–5: scale · R: reset · B: bench</div>
+    <div class="grp-label">STRESS TEST</div>
+    <div class="btns">
+      <button id="stressBtn">randomize 5% of tiles / frame</button>
+    </div>
+    <div class="hint">pick a tool + size, click to paint · drag: rotate<br>arrows: pan · Z/X: zoom · 1–3: grid · S: stress</div>
   </div>
 
-  <div id="resizing">resizing…</div>
+  <div id="loading">building world…</div>
 
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
-// ───────────────────────────── constants & state model ─────────────────────────────
-const WORLD = 200;                 // FR-1: world size is CONSTANT across all N
+// ───────────────────────────── constants ─────────────────────────────
+const WORLD = 200;
 const HALF  = WORLD / 2;
-const STATE = { GRASS: 0, ROAD: 1, SAND: 2, WATER: 3, BUILDING: 4, TREE: 5 };
-const SCALES = [64, 256, 1024, 2048, 4096];
+const LAYERS = 32;          // 32 tile textures (texture array)
+const TILE   = 64;          // px per tile texture
+const SCALES = [64, 128, 256];
+// prop enum stored in state.G : 0 none, 1 tree, 2 building
+const PROP = { NONE: 0, TREE: 1, BLDG: 2 };
+// terrain texture-index groups inside the 32-layer atlas
+const GRASS0 = 0, GRASS_N = 12;     // 0..11  grass variants
+const SAND0  = 12;                  // 12..17 sand/dirt
+const ROCK0  = 18;                  // 18..23 concrete/pavement
+const ROAD0  = 24;                  // 24..29 asphalt (24..27 have markings)
+const WATER0 = 30;                  // 30..31 water
 
-// build palette: which state a click paints, and the brush footprint (NxN tiles).
-const TOOL_NAMES = { '-1': 'Clear', 1: 'Road', 3: 'Water', 4: 'Building', 5: 'Tree' };
-let currentTool = STATE.ROAD;   // -1 = bulldoze (restore natural)
+let N, cellSize;
+let stateData, stateTex;            // RGBA8 state texture — the single source of truth
+let terrainMesh, treeMesh, bldgMesh;
+
+// build-tool ui state
+let currentTool = 'tree';
 let brush = 1;
+let stress = false;
 
-let N = 256;                        // FR-1: default 256
-let cellSize = WORLD / N;
-let data;                          // Uint8Array(N*N) — live state mirror (FR-2)
-let natural;                       // Uint8Array(N*N) — pre-edit terrain (FR-3)
-let stateTex;                      // R8 DataTexture (FR-2)
-
-// ───────────────────────────── renderer / scene / camera ─────────────────────────────
-const app = document.getElementById('app');
+// ───────────────────────────── renderer / scene / lights ─────────────────────────────
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
-const bg = new THREE.Color(0x10131a);
-renderer.setClearColor(bg, 1);
-app.appendChild(renderer.domElement);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 4000);
-camera.position.set(WORLD * 0.55, WORLD * 0.62, WORLD * 0.55);
+const sky = new THREE.Color(0x9fc6e8);
+scene.background = sky;
+scene.fog = new THREE.Fog(sky, WORLD * 0.9, WORLD * 2.6);
+
+const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.5, 3000);
+camera.position.set(WORLD * 0.42, WORLD * 0.5, WORLD * 0.72);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
-controls.minDistance = 12;
-controls.maxDistance = 1200;
-controls.maxPolarAngle = Math.PI * 0.49;   // stay above the horizon
-controls.listenToKeyEvents(window);        // arrow keys pan the camera target
-controls.keyPanSpeed = 14;                  // snappier arrow-key panning
+controls.minDistance = 14;
+controls.maxDistance = 900;
+controls.maxPolarAngle = Math.PI * 0.49;
+controls.listenToKeyEvents(window);
+controls.keyPanSpeed = 16;
 controls.update();
 
-// ───────────────────────────── shader (unlit, GPU-driven) ─────────────────────────────
-// 7.2: every CUSTOM uniform below MUST also be declared in the GLSL or it silently fails (P-3).
-const uniforms = {
-  uState:   { value: null },
-  uN:       { value: N },
-  uOrigin:  { value: new THREE.Vector2(-HALF, -HALF) },   // world-space grid origin
-  uWorld:   { value: WORLD },
-  uHover:   { value: new THREE.Vector2(-1, -1) },         // hovered tile coords, (-1,-1) off-grid
-  uBrush:   { value: 1 },                                 // brush footprint (NxN) for the hover preview
-  uCam:     { value: new THREE.Vector3() },               // updated each frame for fog + line fade
-  uFog:     { value: bg.clone() },
-  uFogNear: { value: WORLD * 0.6 },
-  uFogFar:  { value: WORLD * 2.2 },
-};
+// distant sun + soft sky/ground ambient
+const sun = new THREE.DirectionalLight(0xfff1d8, 2.7);
+sun.position.set(WORLD * 0.5, WORLD * 0.42, WORLD * 0.32);   // low-ish afternoon sun -> long shadows
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = WORLD * 3;
+const sc = HALF * 1.4;
+sun.shadow.camera.left = -sc; sun.shadow.camera.right = sc;
+sun.shadow.camera.top = sc;   sun.shadow.camera.bottom = -sc;
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.05;                                 // small — large values erase small shadows
+scene.add(sun);
+scene.add(sun.target);
+scene.add(new THREE.HemisphereLight(0xbfe0ff, 0x55692f, 0.55));   // soft sky/ground ambient
 
-const vertexShader = /* glsl */`
-  precision highp float;
-  uniform vec3 uCam;
-  varying vec2 vWorld;
-  varying float vDist;
-  void main() {
-    vec4 wp = modelMatrix * vec4(position, 1.0);
-    vWorld = wp.xz;
-    vDist  = distance(uCam, wp.xyz);
-    gl_Position = projectionMatrix * viewMatrix * wp;
+// ───────────────────────────── 32 procedural tile textures (texture array) ───────────────
+function clamp255(v) { return v < 0 ? 0 : v > 255 ? 255 : v | 0; }
+function tileBase(l) {
+  if (l < SAND0) {          // grass: vary hue/brightness across the 12 variants
+    const t = l / GRASS_N;
+    return [70 + t * 30, 120 + (1 - t) * 40 + l * 3, 50 + t * 20];
   }
-`;
-
-const fragmentShader = /* glsl */`
-  precision highp float;
-  uniform sampler2D uState;
-  uniform float uN;
-  uniform vec2  uOrigin;
-  uniform float uWorld;
-  uniform vec2  uHover;
-  uniform float uBrush;
-  uniform vec3  uFog;
-  uniform float uFogNear;
-  uniform float uFogFar;
-  varying vec2  vWorld;
-  varying float vDist;
-
-  // ground colour under each tile (buildings/trees sit on grass) (FR-6)
-  vec3 ground(float s) {
-    if (s < 0.5) return vec3(0.42, 0.62, 0.28); // GRASS
-    if (s < 1.5) return vec3(0.27, 0.28, 0.31); // ROAD
-    if (s < 2.5) return vec3(0.84, 0.77, 0.52); // SAND
-    if (s < 3.5) return vec3(0.18, 0.45, 0.70); // WATER
-    return                vec3(0.42, 0.62, 0.28); // BUILDING / TREE ground
-  }
-
-  // flat top-down glyph: concrete footprint + terracotta roof, inset from the tile
-  vec3 building(vec2 f, vec3 base) {
-    vec2 c = abs(f - 0.5);
-    float m = max(c.x, c.y);                          // chebyshev dist from centre
-    float aa = fwidth(m) + 1e-4;
-    float wall = 1.0 - smoothstep(0.38 - aa, 0.38 + aa, m);
-    float roof = 1.0 - smoothstep(0.24 - aa, 0.24 + aa, m);
-    vec3 col = mix(base, vec3(0.66, 0.64, 0.62), wall);
-    return    mix(col,  vec3(0.52, 0.34, 0.30), roof);
-  }
-
-  // flat top-down glyph: round canopy with a lighter centre
-  vec3 tree(vec2 f, vec3 base) {
-    float d  = length(f - 0.5);
-    float aa = fwidth(d) + 1e-4;
-    float canopy = 1.0 - smoothstep(0.34 - aa, 0.34 + aa, d);
-    vec3 col = mix(base, vec3(0.15, 0.38, 0.17), canopy);
-    float hi = (1.0 - smoothstep(0.10, 0.17, d)) * canopy;
-    return    mix(col,  vec3(0.27, 0.55, 0.27), hi);
-  }
-
-  void main() {
-    vec2 uv = (vWorld - uOrigin) / uWorld;            // [0,1] across the grid
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) discard;
-
-    vec2 cell = uv * uN;                              // tile space
-    vec2 id   = floor(cell);                          // (tx, tz)
-    vec2 f    = fract(cell);                          // local coord within the tile
-
-    // sample state at tile centre, NEAREST (FR-6)
-    float s = texture2D(uState, (id + 0.5) / uN).r * 255.0;
-    vec3 col = ground(s);
-
-    // faint per-tile checker so tiles read as tiles (FR-9, ±3%)
-    float chk = mod(id.x + id.y, 2.0);
-    col *= (chk > 0.5) ? 1.03 : 0.97;
-
-    // flat glyphs for built features
-    if (s > 3.5 && s < 4.5) col = building(f, col);
-    else if (s > 4.5)       col = tree(f, col);
-
-    // analytic anti-aliased gridlines via fwidth (FR-7)
-    vec2 d = fwidth(cell);
-    vec2 g = min(f, 1.0 - f) / max(d, vec2(1e-5));
-    float line = 1.0 - clamp(min(g.x, g.y), 0.0, 1.0);
-    // fade lines with distance -> far field reads as solid blocks (avoids moiré)
-    float lineFade = 1.0 - clamp((vDist - uWorld * 0.2) / (uWorld * 1.2), 0.0, 1.0);
-    col = mix(col, vec3(0.05, 0.06, 0.08), line * 0.5 * lineFade);
-
-    // brush-footprint hover preview — uniform-driven, no upload (FR-16)
-    if (uHover.x >= 0.0) {
-      vec2 h0 = uHover - floor(uBrush * 0.5);         // top-left of the brush square
-      if (id.x >= h0.x && id.x < h0.x + uBrush && id.y >= h0.y && id.y < h0.y + uBrush) {
-        col = mix(col, vec3(1.0, 0.95, 0.62), 0.40);
+  if (l < ROCK0) return [186 - (l - SAND0) * 6, 168 - (l - SAND0) * 5, 120 - (l - SAND0) * 6]; // sand/dirt
+  if (l < ROAD0) return [128 + (l - ROCK0) * 4, 130 + (l - ROCK0) * 4, 136 + (l - ROCK0) * 3]; // concrete
+  if (l < WATER0) return [54 + (l - ROAD0) * 3, 56 + (l - ROAD0) * 3, 62 + (l - ROAD0) * 3];    // asphalt
+  return [40 + (l - WATER0) * 8, 96 + (l - WATER0) * 10, 150 + (l - WATER0) * 16];              // water
+}
+function tileNoise(l) {
+  if (l < SAND0) return 16;
+  if (l < ROCK0) return 14;
+  if (l < ROAD0) return 10;
+  if (l < WATER0) return 7;
+  return 18;
+}
+function genTileArray() {
+  const data = new Uint8Array(TILE * TILE * 4 * LAYERS);
+  for (let l = 0; l < LAYERS; l++) {
+    const base = tileBase(l), noise = tileNoise(l), off = l * TILE * TILE * 4;
+    for (let p = 0; p < TILE * TILE; p++) {
+      const n = (Math.random() * 2 - 1) * noise;
+      data[off + p * 4]     = clamp255(base[0] + n);
+      data[off + p * 4 + 1] = clamp255(base[1] + n);
+      data[off + p * 4 + 2] = clamp255(base[2] + n);
+      data[off + p * 4 + 3] = 255;
+    }
+    // lane markings on a few road layers (centre dashed line)
+    if (l >= ROAD0 && l <= ROAD0 + 3) {
+      for (let y = 0; y < TILE; y++) {
+        if ((y >> 3) % 2 === 0) continue;             // dashes
+        for (let x = 30; x < 34; x++) {
+          const idx = off + (y * TILE + x) * 4;
+          data[idx] = 220; data[idx + 1] = 200; data[idx + 2] = 70;
+        }
       }
     }
-
-    // distance fog (FR-8)
-    float fog = clamp((vDist - uFogNear) / (uFogFar - uFogNear), 0.0, 1.0);
-    col = mix(col, uFog, fog);
-
-    gl_FragColor = vec4(col, 1.0);
   }
-`;
+  const tex = new THREE.DataArrayTexture(data, TILE, TILE, LAYERS);
+  tex.format = THREE.RGBAFormat;
+  tex.type = THREE.UnsignedByteType;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.needsUpdate = true;
+  return tex;
+}
+const tileArray = genTileArray();
 
-const material = new THREE.ShaderMaterial({ uniforms, vertexShader, fragmentShader });
-material.extensions = { derivatives: true };   // P-4: enable fwidth under the GLSL1 path
+// ───────────────────────────── 3D prop geometry (~500-poly tree, box building) ────────────
+function addColor(geo, r, g, b) {
+  const n = geo.attributes.position.count;
+  const col = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { col[i * 3] = r; col[i * 3 + 1] = g; col[i * 3 + 2] = b; }
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  if (geo.attributes.uv) geo.deleteAttribute('uv');           // keep merge attrs consistent
+  return geo;
+}
+function buildTreeGeometry() {
+  // trunk + three stacked cones, ~500 tris, vertex-coloured
+  const trunk = addColor(new THREE.CylinderGeometry(0.06, 0.09, 0.55, 12).translate(0, 0.275, 0), 0.37, 0.25, 0.14);
+  const c1 = addColor(new THREE.ConeGeometry(0.46, 0.6, 26, 2).translate(0, 0.7, 0), 0.17, 0.43, 0.19);
+  const c2 = addColor(new THREE.ConeGeometry(0.35, 0.55, 26, 2).translate(0, 1.0, 0), 0.20, 0.47, 0.21);
+  const c3 = addColor(new THREE.ConeGeometry(0.23, 0.5, 26, 2).translate(0, 1.3, 0), 0.24, 0.52, 0.24);
+  const g = mergeGeometries([trunk, c1, c2, c3], false);
+  g.computeVertexNormals();
+  return g;
+}
+function buildBuildingGeometry() {
+  const box = new THREE.BoxGeometry(0.84, 1, 0.84).translate(0, 0.5, 0);  // base at y=0
+  return addColor(box, 0.66, 0.66, 0.69);
+}
+const treeGeo = buildTreeGeometry();
+const bldgGeo = buildBuildingGeometry();
 
-// FR-5: the ONLY renderable object — one flat quad, frustum culling off.
-const geo  = new THREE.PlaneGeometry(WORLD, WORLD);
-const mesh = new THREE.Mesh(geo, material);
-mesh.rotation.x = -Math.PI / 2;     // lay flat in the XZ plane (normal +Y)
-mesh.frustumCulled = false;
-scene.add(mesh);
+// ───────────────────────────── materials (state-texture driven) ──────────────────────────
+// Terrain: MeshLambert + onBeforeCompile -> sample the 32-layer texture array per tile.
+function makeTerrainMat() {
+  const m = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  m.customProgramCacheKey = () => 'terrain';   // keep onBeforeCompile injections distinct per material
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.uState = { value: stateTex };
+    sh.uniforms.uTiles = { value: tileArray };
+    sh.uniforms.uN = { value: N };
+    sh.uniforms.uHalf = { value: HALF };
+    sh.uniforms.uWorld = { value: WORLD };
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec2 vWXZ;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvWXZ = (modelMatrix * vec4(position,1.0)).xz;');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', `#include <common>
+        varying vec2 vWXZ;
+        uniform sampler2D uState; uniform sampler2DArray uTiles;
+        uniform float uN; uniform float uHalf; uniform float uWorld;`)
+      .replace('#include <map_fragment>', `
+        vec2 uv01 = (vWXZ + uHalf) / uWorld;
+        vec2 cell = uv01 * uN;
+        vec2 id = floor(cell);
+        float layer = floor(texture(uState, (id + 0.5) / uN).r * 255.0 + 0.5);
+        vec4 tcol = texture(uTiles, vec3(fract(cell), layer));
+        diffuseColor.rgb *= tcol.rgb;`);
+  };
+  return m;
+}
 
-// ───────────────────────────── grid state build / fill ─────────────────────────────
-// FR-4: tight typed-array loop, no per-tile objects. Lake + sand ring so >1 state is visible.
-function fillProcedural(arr, n) {
+// shared GLSL: read this instance's tile + prop type from the state texture
+const PROP_DECL = `
+  uniform sampler2D uState; uniform float uN; attribute vec2 aTile;`;
+function treeVertex(begin) {
+  return begin
+    .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>
+      { vec4 _s = texture(uState, (aTile + 0.5) / uN); float _a = _s.b * 6.2831853;
+        objectNormal.xz = mat2(cos(_a), -sin(_a), sin(_a), cos(_a)) * objectNormal.xz; }`)
+    .replace('#include <begin_vertex>', `#include <begin_vertex>
+      vec4 _st = texture(uState, (aTile + 0.5) / uN);
+      float _prop = floor(_st.g * 255.0 + 0.5);
+      if (_prop < 0.5 || _prop > 1.5) { transformed = vec3(0.0); }
+      else {
+        float _h = _st.b; float _ang = _h * 6.2831853; float _sc = 0.75 + _h * 0.6;
+        transformed.xz = mat2(cos(_ang), -sin(_ang), sin(_ang), cos(_ang)) * transformed.xz;
+        transformed *= _sc;
+      }`);
+}
+function bldgVertex(begin) {
+  return begin.replace('#include <begin_vertex>', `#include <begin_vertex>
+      vec4 _st = texture(uState, (aTile + 0.5) / uN);
+      float _prop = floor(_st.g * 255.0 + 0.5);
+      if (_prop < 1.5 || _prop > 2.5) { transformed = vec3(0.0); }
+      else {
+        float _h = _st.b;
+        transformed.y *= mix(2.0, 11.0, _h);
+        transformed.xz *= mix(0.85, 1.0, fract(_h * 7.3));
+      }`);
+}
+function makePropMat(vertexFn, key) {
+  const m = new THREE.MeshLambertMaterial({ vertexColors: true });
+  m.customProgramCacheKey = () => key;
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.uState = { value: stateTex };
+    sh.uniforms.uN = { value: N };
+    sh.vertexShader = vertexFn(sh.vertexShader.replace('#include <common>', '#include <common>' + PROP_DECL));
+  };
+  return m;
+}
+function makePropDepth(vertexFn, key) {
+  const m = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+  m.customProgramCacheKey = () => key;
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.uState = { value: stateTex };
+    sh.uniforms.uN = { value: N };
+    sh.vertexShader = vertexFn(sh.vertexShader.replace('#include <common>', '#include <common>' + PROP_DECL));
+  };
+  return m;
+}
+
+// ───────────────────────────── world build / scale switch ────────────────────────────────
+const terrainGeo = new THREE.PlaneGeometry(WORLD, WORLD);
+const dummy = new THREE.Object3D();
+
+function makeInstanced(baseGeo, mat, depthMat, n) {
+  const g = baseGeo.clone();
+  const aTile = new Float32Array(n * n * 2);
+  const inst = new THREE.InstancedMesh(g, mat, n * n);
+  for (let z = 0, i = 0; z < n; z++) {
+    for (let x = 0; x < n; x++, i++) {
+      aTile[i * 2] = x; aTile[i * 2 + 1] = z;
+      dummy.position.set(-HALF + (x + 0.5) * cellSize, 0, -HALF + (z + 0.5) * cellSize);
+      dummy.scale.setScalar(cellSize);
+      dummy.updateMatrix();
+      inst.setMatrixAt(i, dummy.matrix);
+    }
+  }
+  g.setAttribute('aTile', new THREE.InstancedBufferAttribute(aTile, 2));
+  inst.instanceMatrix.needsUpdate = true;
+  inst.castShadow = true;
+  inst.receiveShadow = true;
+  inst.frustumCulled = false;            // placement is done on the GPU
+  inst.customDepthMaterial = depthMat;   // shadows respect the same visibility logic
+  return inst;
+}
+
+function disposeWorld() {
+  for (const m of [terrainMesh, treeMesh, bldgMesh]) {
+    if (!m) continue;
+    scene.remove(m);
+    if (m.geometry !== terrainGeo) m.geometry.dispose();
+    m.material.dispose();
+    if (m.customDepthMaterial) m.customDepthMaterial.dispose();
+  }
+  if (stateTex) stateTex.dispose();
+}
+
+function createWorld(n) {
+  disposeWorld();
+  N = n; cellSize = WORLD / N;
+
+  stateData = new Uint8Array(n * n * 4);
+  fillCity(stateData, n);
+  stateTex = new THREE.DataTexture(stateData, n, n, THREE.RGBAFormat, THREE.UnsignedByteType);
+  stateTex.magFilter = stateTex.minFilter = THREE.NearestFilter;
+  stateTex.wrapS = stateTex.wrapT = THREE.ClampToEdgeWrapping;
+  stateTex.needsUpdate = true;
+
+  terrainMesh = new THREE.Mesh(terrainGeo, makeTerrainMat());
+  terrainMesh.rotation.x = -Math.PI / 2;
+  terrainMesh.receiveShadow = true;
+  terrainMesh.frustumCulled = false;
+  scene.add(terrainMesh);
+
+  treeMesh = makeInstanced(treeGeo, makePropMat(treeVertex, 'tree'), makePropDepth(treeVertex, 'tree-depth'), n);
+  bldgMesh = makeInstanced(bldgGeo, makePropMat(bldgVertex, 'bldg'), makePropDepth(bldgVertex, 'bldg-depth'), n);
+  scene.add(treeMesh, bldgMesh);
+
+  updateHudStatic();
+}
+
+// procedural starting scene: forest + central downtown + a lake
+function rnd(a, b) { return a + Math.random() * (b - a); }
+function setTile(arr, n, x, z, layer, prop, variant) {
+  const i = (z * n + x) * 4;
+  arr[i] = layer; arr[i + 1] = prop; arr[i + 2] = variant; arr[i + 3] = 255;
+}
+function fillCity(arr, n) {
   const cx = n * 0.5, cz = n * 0.5;
-  const lakeR = n * 0.17;
-  const sandR = lakeR + Math.max(2, n * 0.05);
-  const lakeR2 = lakeR * lakeR, sandR2 = sandR * sandR;
+  const lakeX = n * 0.74, lakeZ = n * 0.30, lakeR = n * 0.12;
+  const town = Math.round(n * 0.22);                 // downtown half-extent
   for (let z = 0; z < n; z++) {
-    const row = z * n;
-    const dz = z - cz, dz2 = dz * dz;
     for (let x = 0; x < n; x++) {
-      const dx = x - cx;
-      const r2 = dx * dx + dz2;
-      let s = STATE.GRASS;
-      if (r2 < lakeR2)      s = STATE.WATER;
-      else if (r2 < sandR2) s = STATE.SAND;
-      arr[row + x] = s;
+      const dlx = x - lakeX, dlz = z - lakeZ;
+      const inLake = dlx * dlx + dlz * dlz < lakeR * lakeR;
+      const inTown = Math.abs(x - cx) < town && Math.abs(z - cz) < town;
+      if (inLake) { setTile(arr, n, x, z, WATER0 + (Math.random() < 0.5 ? 0 : 1), PROP.NONE, 0); continue; }
+      if (inTown) {
+        const lx = x - (cx - town), lz = z - (cz - town);
+        const onRoad = (lx % 5 === 0) || (lz % 5 === 0);
+        if (onRoad) { setTile(arr, n, x, z, ROAD0 + (Math.random() * 4 | 0), PROP.NONE, 0); }
+        else if (Math.random() < 0.55) {
+          const hv = Math.random();                                  // bias toward low-rise, few towers
+          setTile(arr, n, x, z, ROCK0 + (Math.random() * 6 | 0), PROP.BLDG, (hv * hv * 255) | 0);
+        } else {
+          setTile(arr, n, x, z, ROCK0 + (Math.random() * 6 | 0), Math.random() < 0.15 ? PROP.TREE : PROP.NONE, rnd(0, 255) | 0);
+        }
+        continue;
+      }
+      // open country: grass with ~10% trees
+      const tree = Math.random() < 0.10;
+      setTile(arr, n, x, z, GRASS0 + (Math.random() * GRASS_N | 0), tree ? PROP.TREE : PROP.NONE, rnd(0, 255) | 0);
     }
   }
 }
 
-// FR-18: the ONLY place large (one-time) allocation happens.
-function createState(n) {
-  N = n;
-  cellSize = WORLD / N;
-  data    = new Uint8Array(n * n);
-  natural = new Uint8Array(n * n);
-  fillProcedural(natural, n);
-  data.set(natural);
-
-  // 7.1: R8 DataTexture, NEAREST, clamp, byte-aligned rows, forced GPU upload.
-  stateTex = new THREE.DataTexture(data, n, n, THREE.RedFormat, THREE.UnsignedByteType);
-  stateTex.magFilter = THREE.NearestFilter;
-  stateTex.minFilter = THREE.NearestFilter;      // P-7: no mipmaps on the index texture
-  stateTex.wrapS = stateTex.wrapT = THREE.ClampToEdgeWrapping;
-  stateTex.unpackAlignment = 1;                   // P-6: R8 rows are byte-packed
-  stateTex.needsUpdate = true;
-  renderer.initTexture(stateTex);                 // force upload so __webglTexture exists for editing
-
-  uniforms.uState.value = stateTex;
-  uniforms.uN.value = N;
-}
-
-// ───────────────────────────── picking (ray vs y=0 plane) ─────────────────────────────
-// 7.4 — all scratch created once, reused forever (AC-5 / P-9).
+// ───────────────────────────── picking (ray vs y=0 plane) ────────────────────────────────
 const raycaster = new THREE.Raycaster();
 const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 const hit = new THREE.Vector3();
 const ndc = new THREE.Vector2();
-
-function tileAt(clientX, clientY) {
-  ndc.set((clientX / window.innerWidth) * 2 - 1, -(clientY / window.innerHeight) * 2 + 1);
+function tileAt(cx, cy) {
+  ndc.set((cx / innerWidth) * 2 - 1, -(cy / innerHeight) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   if (!raycaster.ray.intersectPlane(plane, hit)) return null;
   const tx = Math.floor((hit.x + HALF) / WORLD * N);
   const tz = Math.floor((hit.z + HALF) / WORLD * N);
-  if (tx < 0 || tz < 0 || tx >= N || tz >= N) return null;
-  hoverScratch.tx = tx; hoverScratch.tz = tz;     // reused object, no per-call alloc
-  return hoverScratch;
+  return (tx < 0 || tz < 0 || tx >= N || tz >= N) ? null : { tx, tz };
 }
-const hoverScratch = { tx: -1, tz: -1 };
 
-// ───────────────────────────── editing (brush-region upload) ─────────────────────────────
-// 7.3 — partial GPU upload (1..256 texels), one reused scratch buffer, no scene rebuild
-// (FR-11/12, AC-4). A 1×1 brush is a single-texel texSubImage2D, exactly as the spec.
-const brushBuf = new Uint8Array(16 * 16);          // module scope — reused, never reallocated
-const gl = renderer.getContext();
-const texHandle = () => renderer.properties.get(stateTex).__webglTexture;
-
-// Paint a brush×brush square centred on (txc,tzc). value < 0 = bulldoze (restore natural).
-function paintRegion(txc, tzc, value) {
-  let x0 = txc - (brush >> 1), z0 = tzc - (brush >> 1);
-  let x1 = Math.min(N, x0 + brush), z1 = Math.min(N, z0 + brush);
-  x0 = Math.max(0, x0); z0 = Math.max(0, z0);
-  const w = x1 - x0, h = z1 - z0;
-  if (w <= 0 || h <= 0) return;
-
-  let k = 0;                                        // pack rows tightly (row length = w)
-  for (let z = z0; z < z1; z++) {
-    const row = z * N;
-    for (let x = x0; x < x1; x++) {
-      const v = value < 0 ? natural[row + x] : value;
-      data[row + x] = v;                            // keep CPU mirror in sync
-      brushBuf[k++] = v;
-    }
+// ───────────────────────────── editing (write the state texture) ─────────────────────────
+let editsThisSec = 0;
+function applyTool(x, z) {
+  const i = (z * N + x) * 4;
+  switch (currentTool) {
+    case 'tree':  stateData[i] = GRASS0 + (Math.random() * GRASS_N | 0); stateData[i + 1] = PROP.TREE; stateData[i + 2] = Math.random() * 255 | 0; break;
+    case 'bldg':  stateData[i] = ROCK0 + (Math.random() * 6 | 0);        stateData[i + 1] = PROP.BLDG; stateData[i + 2] = (Math.random() ** 2 * 255) | 0; break;
+    case 'road':  stateData[i] = ROAD0 + (Math.random() * 4 | 0);        stateData[i + 1] = PROP.NONE; break;
+    case 'grass': stateData[i] = GRASS0 + (Math.random() * GRASS_N | 0); stateData[i + 1] = PROP.NONE; break;
+    case 'water': stateData[i] = WATER0 + (Math.random() < 0.5 ? 0 : 1); stateData[i + 1] = PROP.NONE; break;
+    case 'clear': stateData[i + 1] = PROP.NONE; break;
   }
-  gl.bindTexture(gl.TEXTURE_2D, texHandle());
-  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  gl.texSubImage2D(gl.TEXTURE_2D, 0, x0, z0, w, h, gl.RED, gl.UNSIGNED_BYTE, brushBuf);
-  renderer.resetState();                            // P-5: re-sync three's cached GL state
+  editsThisSec++;
+}
+function paintRegion(txc, tzc) {
+  const x0 = Math.max(0, txc - (brush >> 1)), z0 = Math.max(0, tzc - (brush >> 1));
+  const x1 = Math.min(N, x0 + brush), z1 = Math.min(N, z0 + brush);
+  for (let z = z0; z < z1; z++) for (let x = x0; x < x1; x++) applyTool(x, z);
+  stateTex.needsUpdate = true;                 // one re-upload of the small state texture
 }
 
-function resetAll() {
-  data.set(natural);
-  stateTex.needsUpdate = true;                      // FR-13: full re-upload OK for a one-shot reset
+// stress: randomly mutate 5% of tiles every frame (no instance buffers touched)
+function stressStep() {
+  const k = Math.floor(N * N * 0.05);
+  for (let j = 0; j < k; j++) {
+    const x = Math.random() * N | 0, z = Math.random() * N | 0, i = (z * N + x) * 4;
+    const r = Math.random();
+    stateData[i] = GRASS0 + (Math.random() * GRASS_N | 0);
+    stateData[i + 1] = r < 0.1 ? PROP.TREE : (r < 0.13 ? PROP.BLDG : PROP.NONE);
+    stateData[i + 2] = Math.random() * 255 | 0;
+  }
+  editsThisSec += k;
+  stateTex.needsUpdate = true;
 }
 
-// ───────────────────────────── pointer: click vs orbit-drag ─────────────────────────────
+// ───────────────────────────── pointer (click vs orbit-drag) + hover ─────────────────────
 let downX = 0, downY = 0, moved = false;
-const DRAG_PX = 5;                                  // FR-15
 const dom = renderer.domElement;
-
-dom.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0) return;
-  downX = e.clientX; downY = e.clientY; moved = false;
-});
+dom.addEventListener('pointerdown', (e) => { if (e.button === 0) { downX = e.clientX; downY = e.clientY; moved = false; } });
 dom.addEventListener('pointermove', (e) => {
-  if (Math.abs(e.clientX - downX) > DRAG_PX || Math.abs(e.clientY - downY) > DRAG_PX) moved = true;
-  const t = tileAt(e.clientX, e.clientY);           // FR-16: hover = uniform write only
-  if (t) uniforms.uHover.value.set(t.tx, t.tz);
-  else   uniforms.uHover.value.set(-1, -1);
+  if (Math.abs(e.clientX - downX) > 5 || Math.abs(e.clientY - downY) > 5) moved = true;
 });
 dom.addEventListener('pointerup', (e) => {
-  if (e.button !== 0 || moved) return;              // a drag was an orbit, not an edit
+  if (e.button !== 0 || moved) return;
   const t = tileAt(e.clientX, e.clientY);
-  if (t) paintRegion(t.tx, t.tz, currentTool);      // paint the selected tool at the brush size
+  if (t) paintRegion(t.tx, t.tz);
 });
-dom.addEventListener('pointerleave', () => uniforms.uHover.value.set(-1, -1));
 
-// ───────────────────────────── scale switching ─────────────────────────────
-const resizingEl = document.getElementById('resizing');
-function setScale(n) {
-  if (n === N) return;
-  resizingEl.style.display = 'flex';
-  // defer two frames so the "resizing…" overlay actually paints before the big fill
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    const old = stateTex;
-    createState(n);                  // FR-18: realloc arrays + texture, update uniforms
-    old.dispose();                   // dispose the previous GPU texture
-    syncScaleButtons();
-    updateHudStatic();
-    resizingEl.style.display = 'none';
-  }));
-}
-
-document.querySelectorAll('.scales button').forEach((b) => {
-  b.addEventListener('click', () => setScale(+b.dataset.n));
-});
-function syncScaleButtons() {
-  document.querySelectorAll('.scales button').forEach((b) => {
-    b.classList.toggle('active', +b.dataset.n === N);
-  });
-}
-
-// build-palette wiring (tool + brush size)
+// ───────────────────────────── UI wiring ─────────────────────────────
+const TOOL_NAMES = { tree: 'Tree', bldg: 'Building', road: 'Road', grass: 'Grass', water: 'Water', clear: 'Clear' };
 const elTool = document.getElementById('hud-tool');
-function updateToolHud() { elTool.textContent = `${TOOL_NAMES[currentTool]} · ${brush}×${brush}`; }
-function syncToolButtons() {
-  document.querySelectorAll('.tools button').forEach((b) =>
-    b.classList.toggle('active', +b.dataset.tool === currentTool));
-  document.querySelectorAll('.brush button').forEach((b) =>
-    b.classList.toggle('active', +b.dataset.brush === brush));
-  updateToolHud();
+function syncButtons() {
+  document.querySelectorAll('#tools button').forEach((b) => b.classList.toggle('active', b.dataset.tool === currentTool));
+  document.querySelectorAll('#brushes button').forEach((b) => b.classList.toggle('active', +b.dataset.brush === brush));
+  document.querySelectorAll('#scales button').forEach((b) => b.classList.toggle('active', +b.dataset.n === N));
+  elTool.textContent = `${TOOL_NAMES[currentTool]} · ${brush}×${brush}`;
 }
-document.querySelectorAll('.tools button').forEach((b) => {
-  b.addEventListener('click', () => { currentTool = +b.dataset.tool; syncToolButtons(); });
-});
-document.querySelectorAll('.brush button').forEach((b) => {
-  b.addEventListener('click', () => {
-    brush = +b.dataset.brush;
-    uniforms.uBrush.value = brush;                  // hover preview matches the brush
-    syncToolButtons();
-  });
-});
+document.querySelectorAll('#tools button').forEach((b) => b.addEventListener('click', () => { currentTool = b.dataset.tool; syncButtons(); }));
+document.querySelectorAll('#brushes button').forEach((b) => b.addEventListener('click', () => { brush = +b.dataset.brush; syncButtons(); }));
+document.querySelectorAll('#scales button').forEach((b) => b.addEventListener('click', () => switchScale(+b.dataset.n)));
+const stressBtn = document.getElementById('stressBtn');
+stressBtn.addEventListener('click', () => { stress = !stress; stressBtn.classList.toggle('on', stress); });
 
-// keyboard zoom (Z in / X out) — dolly along the view ray, reused scratch (no alloc)
+const loadingEl = document.getElementById('loading');
+function switchScale(n) {
+  if (n === N) return;
+  loadingEl.style.display = 'flex';
+  requestAnimationFrame(() => requestAnimationFrame(() => { createWorld(n); syncButtons(); loadingEl.style.display = 'none'; }));
+}
+window.addEventListener('keydown', (e) => {
+  if (e.key >= '1' && e.key <= '3') switchScale(SCALES[+e.key - 1]);
+  else if (e.key === 'z' || e.key === 'Z') zoomBy(0.9);
+  else if (e.key === 'x' || e.key === 'X') zoomBy(1.1);
+  else if (e.key === 's' || e.key === 'S') { stress = !stress; stressBtn.classList.toggle('on', stress); }
+});
 const camOffset = new THREE.Vector3();
-function zoomBy(factor) {
+function zoomBy(f) {
   camOffset.copy(camera.position).sub(controls.target);
-  const dist = Math.min(controls.maxDistance, Math.max(controls.minDistance, camOffset.length() * factor));
-  camOffset.setLength(dist);
+  camOffset.setLength(Math.min(controls.maxDistance, Math.max(controls.minDistance, camOffset.length() * f)));
   camera.position.copy(controls.target).add(camOffset);
   controls.update();
 }
 
-window.addEventListener('keydown', (e) => {
-  if (e.key >= '1' && e.key <= '5') setScale(SCALES[+e.key - 1]);   // FR-17
-  else if (e.key === 'r' || e.key === 'R') resetAll();
-  else if (e.key === 'b' || e.key === 'B') runBenchmark();
-  else if (e.key === 'z' || e.key === 'Z') zoomBy(0.9);            // zoom in
-  else if (e.key === 'x' || e.key === 'X') zoomBy(1.1);            // zoom out
-  // arrow keys are handled by OrbitControls.listenToKeyEvents (pan)
-});
-
-// ───────────────────────────── HUD / telemetry ─────────────────────────────
+// ───────────────────────────── HUD / loop ─────────────────────────────
 const elCalls = document.getElementById('hud-calls');
-const elFps   = document.getElementById('hud-fps');
-const elGrid  = document.getElementById('hud-grid');
+const elFps = document.getElementById('hud-fps');
+const elGrid = document.getElementById('hud-grid');
 const elTiles = document.getElementById('hud-tiles');
-const elVram  = document.getElementById('hud-vram');
-const elHover = document.getElementById('hud-hover');
-const elBench = document.getElementById('hud-bench');
-
+const elTrees = document.getElementById('hud-trees');
+const elEdits = document.getElementById('hud-edits');
 const spark = document.getElementById('spark');
-const sctx  = spark.getContext('2d');
-const ftHist = new Float32Array(spark.width);       // preallocated frame-time ring (no per-frame alloc)
+const sctx = spark.getContext('2d');
+const ftHist = new Float32Array(spark.width);
 let ftIdx = 0;
-
-function fmtBytes(b) {
-  if (b >= 1048576) return (b / 1048576).toFixed(2) + ' MB';
-  if (b >= 1024)    return (b / 1024).toFixed(1) + ' KB';
-  return b + ' B';
-}
-function updateHudStatic() {                         // FR-19: grid / tiles / VRAM
-  elGrid.textContent  = N + '×' + N;
+function updateHudStatic() {
+  elGrid.textContent = N + '×' + N;
   elTiles.textContent = (N * N).toLocaleString();
-  elVram.textContent  = fmtBytes(N * N);             // R8 = 1 byte/tile
+  elTrees.textContent = (N * N).toLocaleString();   // capacity (one per tile, GPU-culled)
 }
-
 function drawSpark() {
   const w = spark.width, h = spark.height;
   sctx.clearRect(0, 0, w, h);
-  // 8.33 ms target line (120 Hz budget)
   const ty = h - Math.min(8.33 / 33.3, 1) * h;
-  sctx.strokeStyle = 'rgba(90,210,139,0.35)';
-  sctx.beginPath(); sctx.moveTo(0, ty); sctx.lineTo(w, ty); sctx.stroke();
-  // frame-time trace, scaled 0..33ms
-  sctx.strokeStyle = '#7fb2ff';
-  sctx.lineWidth = 1;
-  sctx.beginPath();
+  sctx.strokeStyle = 'rgba(90,210,139,0.35)'; sctx.beginPath(); sctx.moveTo(0, ty); sctx.lineTo(w, ty); sctx.stroke();
+  sctx.strokeStyle = '#7fb2ff'; sctx.beginPath();
   for (let i = 0; i < w; i++) {
     const ms = ftHist[(ftIdx + i) % w];
     const y = h - Math.min(ms / 33.3, 1) * h;
-    if (i === 0) sctx.moveTo(i, y); else sctx.lineTo(i, y);
+    i === 0 ? sctx.moveTo(i, y) : sctx.lineTo(i, y);
   }
   sctx.stroke();
 }
 
-// ───────────────────────────── benchmark (outside vsync) ─────────────────────────────
-function runBenchmark() {                            // FR-21
-  const M = 200;
-  const t0 = performance.now();
-  for (let i = 0; i < M; i++) renderer.render(scene, camera);
-  const ms = (performance.now() - t0) / M;
-  elBench.textContent = `bench: ${ms.toFixed(3)} ms/frame · ${(1000 / ms).toFixed(0)} fps headroom`;
-}
-
-// ───────────────────────────── render loop ─────────────────────────────
-let prev = performance.now();
-let fpsSmooth = 0;
-let hudAccum = 0;
-
+let prev = performance.now(), fpsSmooth = 0, hudAccum = 0, secAccum = 0, edps = 0;
 function frame(now) {
   requestAnimationFrame(frame);
   const dt = now - prev; prev = now;
-
+  if (stress) stressStep();
   controls.update();
-  uniforms.uCam.value.copy(camera.position);        // reused vector, no alloc (AC-5)
   renderer.render(scene, camera);
 
-  const calls = renderer.info.render.calls;         // read POST-render (FR-19)
-
-  // sparkline every frame (canvas only, adds 0 WebGL draw calls)
-  ftHist[ftIdx] = dt; ftIdx = (ftIdx + 1) % spark.width;
-  drawSpark();
-
-  // throttle text/DOM updates to ~5 Hz to keep the hot loop allocation-light
+  const calls = renderer.info.render.calls;
+  ftHist[ftIdx] = dt; ftIdx = (ftIdx + 1) % spark.width; drawSpark();
   fpsSmooth = fpsSmooth ? fpsSmooth * 0.9 + (1000 / dt) * 0.1 : 1000 / dt;
+  secAccum += dt;
+  if (secAccum >= 1000) { edps = editsThisSec; editsThisSec = 0; secAccum = 0; }
   hudAccum += dt;
   if (hudAccum >= 200) {
     hudAccum = 0;
     elCalls.textContent = calls;
-    elCalls.className = 'v ' + (calls === 1 ? 'ok' : 'warn');
+    elCalls.className = 'v ' + (calls < 100 ? 'ok' : 'warn');   // budget: keep it under ~100
     elFps.textContent = fpsSmooth.toFixed(0);
-    const h = uniforms.uHover.value;
-    elHover.textContent = h.x >= 0 ? `${h.x | 0}, ${h.y | 0}` : '—';
+    elEdits.textContent = edps.toLocaleString();
   }
 }
 
-// ───────────────────────────── window resize ─────────────────────────────
 window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setSize(innerWidth, innerHeight);
 });
 
-// ───────────────────────────── boot ─────────────────────────────
-createState(N);
-syncScaleButtons();
-syncToolButtons();
-updateHudStatic();
+// boot
+createWorld(128);
+syncButtons();
+loadingEl.style.display = 'none';
 requestAnimationFrame(frame);
 </script>
 </body>
