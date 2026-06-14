@@ -47,13 +47,23 @@ PASS: every scale renders the terrain in exactly 1 draw call.
 
 | Input | Action |
 |-------|--------|
-| **Left-click** a tile | Build / clear a road (toggles ROAD ↔ the natural tile underneath) |
+| **Left-click** | Paint the selected tool over a brush-sized square |
+| **BUILD** buttons | Choose what to paint: Road / Building / Tree / Water / Clear (bulldoze → natural) |
+| **BRUSH** buttons | Choose the footprint: 1×1 / 4×4 / 16×16 tiles |
 | **Drag** | Rotate the camera (a drag > 5 px is never treated as a click) |
 | **Arrow keys** | Pan the camera across the map |
 | **Z / X** | Zoom in / out (mouse scroll also zooms) |
 | **1–5** or HUD buttons | Switch grid scale: 64 / 256 / 1024 / 2048 / 4096 |
 | **R** | Reset all tiles to the natural terrain |
 | **B** | Benchmark — render N frames outside vsync, report ms/frame headroom |
+
+**Build palette (flat).** Pick a tool and brush size in the HUD, then click to paint that
+square. Buildings and trees are **flat top-down glyphs** drawn per-tile in the fragment
+shader (a roofed footprint; a round canopy) — they're just extra tile *states* in the same
+R8 texture, so the whole map still renders in **one draw call**, and a click uploads only
+the painted brush rectangle via `texSubImage2D` (1–256 texels, one reused scratch buffer).
+This is intentionally the flat texture-state approach (the user asked for flat), **not** the
+3D `InstancedMesh` building layer sketched in spec §11 — that remains future work.
 
 The HUD (top-left) shows live **draw calls** (green when 1), **FPS** + a frame-time
 sparkline (with the 8.33 ms / 120 Hz budget line), **grid size**, **tile count**,
