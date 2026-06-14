@@ -48,8 +48,9 @@ PASS: every scale renders the terrain in exactly 1 draw call.
 | Input | Action |
 |-------|--------|
 | **Left-click** a tile | Build / clear a road (toggles ROAD ↔ the natural tile underneath) |
-| **Drag** | Orbit the camera (a drag > 5 px is never treated as a click) |
-| **Scroll** | Zoom |
+| **Drag** | Rotate the camera (a drag > 5 px is never treated as a click) |
+| **Arrow keys** | Pan the camera across the map |
+| **Z / X** | Zoom in / out (mouse scroll also zooms) |
 | **1–5** or HUD buttons | Switch grid scale: 64 / 256 / 1024 / 2048 / 4096 |
 | **R** | Reset all tiles to the natural terrain |
 | **B** | Benchmark — render N frames outside vsync, report ms/frame headroom |

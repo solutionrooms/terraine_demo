@@ -81,7 +81,7 @@
       <button data-n="4096">4096</button>
     </div>
     <div id="hud-bench"></div>
-    <div class="hint">click: build / clear road · drag: orbit · scroll: zoom<br>R: reset · 1–5: scale · B: benchmark</div>
+    <div class="hint">click: build road · drag: rotate · arrows: pan<br>Z / X or scroll: zoom · 1–5: scale · R: reset · B: bench</div>
   </div>
 
   <div id="resizing">resizing…</div>
@@ -122,6 +122,8 @@ controls.dampingFactor = 0.08;
 controls.minDistance = 12;
 controls.maxDistance = 1200;
 controls.maxPolarAngle = Math.PI * 0.49;   // stay above the horizon
+controls.listenToKeyEvents(window);        // arrow keys pan the camera target
+controls.keyPanSpeed = 14;                  // snappier arrow-key panning
 controls.update();
 
 // ───────────────────────────── shader (unlit, GPU-driven) ─────────────────────────────
@@ -355,10 +357,23 @@ function syncScaleButtons() {
   });
 }
 
+// keyboard zoom (Z in / X out) — dolly along the view ray, reused scratch (no alloc)
+const camOffset = new THREE.Vector3();
+function zoomBy(factor) {
+  camOffset.copy(camera.position).sub(controls.target);
+  const dist = Math.min(controls.maxDistance, Math.max(controls.minDistance, camOffset.length() * factor));
+  camOffset.setLength(dist);
+  camera.position.copy(controls.target).add(camOffset);
+  controls.update();
+}
+
 window.addEventListener('keydown', (e) => {
   if (e.key >= '1' && e.key <= '5') setScale(SCALES[+e.key - 1]);   // FR-17
   else if (e.key === 'r' || e.key === 'R') resetAll();
   else if (e.key === 'b' || e.key === 'B') runBenchmark();
+  else if (e.key === 'z' || e.key === 'Z') zoomBy(0.9);            // zoom in
+  else if (e.key === 'x' || e.key === 'X') zoomBy(1.1);            // zoom out
+  // arrow keys are handled by OrbitControls.listenToKeyEvents (pan)
 });
 
 // ───────────────────────────── HUD / telemetry ─────────────────────────────
