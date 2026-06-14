@@ -14,7 +14,7 @@
     position:fixed; top:14px; left:14px; z-index:10; pointer-events:none;
     color:var(--fg); background:rgba(14,20,30,0.74);
     border:1px solid rgba(255,255,255,0.10); border-radius:10px;
-    padding:12px 14px 10px; width:220px;
+    padding:12px 14px 10px; width:224px;
     backdrop-filter:blur(6px); box-shadow:0 8px 28px rgba(0,0,0,0.45); user-select:none;
   }
   #hud .title { font-size:11px; letter-spacing:1.4px; color:var(--dim); margin-bottom:8px; }
@@ -22,11 +22,11 @@
   #hud .k { color:var(--dim); }
   #hud .v { color:var(--fg); font-variant-numeric:tabular-nums; }
   #hud-calls.ok { color:var(--ok); } #hud-calls.warn { color:var(--warn); }
-  #spark { display:block; width:192px; height:32px; margin:6px 0 4px; }
+  #spark { display:block; width:196px; height:32px; margin:6px 0 4px; }
   .grp-label { font-size:10px; letter-spacing:1.2px; color:var(--dim); margin-top:11px; }
   .btns { display:flex; gap:5px; margin-top:5px; pointer-events:auto; flex-wrap:wrap; }
   .btns button {
-    flex:1 1 0; min-width:32px; pointer-events:auto;
+    flex:1 1 0; min-width:30px; pointer-events:auto;
     background:rgba(255,255,255,0.06); color:var(--fg);
     border:1px solid rgba(255,255,255,0.10); border-radius:6px;
     padding:5px 0; font-size:10.5px; cursor:pointer;
@@ -55,10 +55,10 @@
     <div class="title">GPU CITY · FLAT GRID + 3D PROPS</div>
     <div class="row"><span class="k">Draw calls</span><span id="hud-calls" class="v">–</span></div>
     <div class="row"><span class="k">FPS</span><span id="hud-fps" class="v">–</span></div>
-    <canvas id="spark" width="192" height="32"></canvas>
+    <canvas id="spark" width="196" height="32"></canvas>
     <div class="row"><span class="k">Grid</span><span id="hud-grid" class="v">–</span></div>
     <div class="row"><span class="k">Tiles</span><span id="hud-tiles" class="v">–</span></div>
-    <div class="row"><span class="k">Tree instances</span><span id="hud-trees" class="v">–</span></div>
+    <div class="row"><span class="k">Trees / Bldgs</span><span id="hud-props" class="v">–</span></div>
     <div class="row"><span class="k">Edits / s</span><span id="hud-edits" class="v">–</span></div>
     <div class="row"><span class="k">Tool</span><span id="hud-tool" class="v">Tree · 1×1</span></div>
 
@@ -80,14 +80,20 @@
     <div class="grp-label">GRID</div>
     <div class="btns" id="scales">
       <button data-n="64">64</button>
-      <button data-n="128">128</button>
       <button data-n="256">256</button>
+      <button data-n="1024">1024</button>
+      <button data-n="2048">2048</button>
+      <button data-n="4096">4096</button>
+    </div>
+    <div class="grp-label">SHADOWS</div>
+    <div class="btns">
+      <button id="shadowBtn" class="active">on</button>
     </div>
     <div class="grp-label">STRESS TEST</div>
     <div class="btns">
       <button id="stressBtn">randomize 5% of tiles / frame</button>
     </div>
-    <div class="hint">pick a tool + size, click to paint · drag: rotate<br>arrows: pan · Z/X: zoom · 1–3: grid · S: stress</div>
+    <div class="hint">pick a tool + size, click to paint · drag: rotate<br>arrows: pan · Z/X: zoom · 1–5: grid · H: shadows · S: stress</div>
   </div>
 
   <div id="loading">building world…</div>
@@ -101,25 +107,25 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 const WORLD = 200;
 const HALF  = WORLD / 2;
 const LAYERS = 32;          // 32 tile textures (texture array)
-const TILE   = 64;          // px per tile texture
-const SCALES = [64, 128, 256];
-// prop enum stored in state.G : 0 none, 1 tree, 2 building
+const TILE   = 64;
+const SCALES = [64, 256, 1024, 2048, 4096];
 const PROP = { NONE: 0, TREE: 1, BLDG: 2 };
+// instanced prop budget (independent of grid size — this is what lets the grid scale)
+const TREE_CAP = 120000, BLDG_CAP = 30000;
+const STRESS_MAX = 40000;   // cap stress edits/frame so huge grids stay interactive
+
 // terrain texture-index groups inside the 32-layer atlas
-const GRASS0 = 0, GRASS_N = 12;     // 0..11  grass variants
-const SAND0  = 12;                  // 12..17 sand/dirt
-const ROCK0  = 18;                  // 18..23 concrete/pavement
-const ROAD0  = 24;                  // 24..29 asphalt (24..27 have markings)
-const WATER0 = 30;                  // 30..31 water
+const GRASS0 = 0, GRASS_N = 12, SAND0 = 12, ROCK0 = 18, ROAD0 = 24, WATER0 = 30;
 
-let N, cellSize;
-let stateData, stateTex;            // RGBA8 state texture — the single source of truth
+let N, cellSize, propScale;
+let stateData, stateTex;                 // R8 terrain-index texture (the scalable terrain layer)
 let terrainMesh, treeMesh, bldgMesh;
+let treeCount = 0, bldgCount = 0;
+const propAt = new Map();                // tileIndex -> { layer:0|1, idx }
+const treeTileOf = new Int32Array(TREE_CAP);
+const bldgTileOf = new Int32Array(BLDG_CAP);
 
-// build-tool ui state
-let currentTool = 'tree';
-let brush = 1;
-let stress = false;
+let currentTool = 'tree', brush = 1, stress = false;
 
 // ───────────────────────────── renderer / scene / lights ─────────────────────────────
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
@@ -148,86 +154,66 @@ controls.listenToKeyEvents(window);
 controls.keyPanSpeed = 16;
 controls.update();
 
-// distant sun + soft sky/ground ambient
 const sun = new THREE.DirectionalLight(0xfff1d8, 2.7);
-sun.position.set(WORLD * 0.5, WORLD * 0.42, WORLD * 0.32);   // low-ish afternoon sun -> long shadows
+sun.position.set(WORLD * 0.5, WORLD * 0.42, WORLD * 0.32);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.camera.near = 1;
 sun.shadow.camera.far = WORLD * 3;
-const sc = HALF * 1.4;
-sun.shadow.camera.left = -sc; sun.shadow.camera.right = sc;
-sun.shadow.camera.top = sc;   sun.shadow.camera.bottom = -sc;
+const scExt = HALF * 1.4;
+sun.shadow.camera.left = -scExt; sun.shadow.camera.right = scExt;
+sun.shadow.camera.top = scExt;   sun.shadow.camera.bottom = -scExt;
 sun.shadow.bias = -0.0004;
-sun.shadow.normalBias = 0.05;                                 // small — large values erase small shadows
-scene.add(sun);
-scene.add(sun.target);
-scene.add(new THREE.HemisphereLight(0xbfe0ff, 0x55692f, 0.55));   // soft sky/ground ambient
+sun.shadow.normalBias = 0.05;
+scene.add(sun, sun.target);
+scene.add(new THREE.HemisphereLight(0xbfe0ff, 0x55692f, 0.55));
 
 // ───────────────────────────── 32 procedural tile textures (texture array) ───────────────
 function clamp255(v) { return v < 0 ? 0 : v > 255 ? 255 : v | 0; }
 function tileBase(l) {
-  if (l < SAND0) {          // grass: vary hue/brightness across the 12 variants
-    const t = l / GRASS_N;
-    return [70 + t * 30, 120 + (1 - t) * 40 + l * 3, 50 + t * 20];
-  }
-  if (l < ROCK0) return [186 - (l - SAND0) * 6, 168 - (l - SAND0) * 5, 120 - (l - SAND0) * 6]; // sand/dirt
-  if (l < ROAD0) return [128 + (l - ROCK0) * 4, 130 + (l - ROCK0) * 4, 136 + (l - ROCK0) * 3]; // concrete
-  if (l < WATER0) return [54 + (l - ROAD0) * 3, 56 + (l - ROAD0) * 3, 62 + (l - ROAD0) * 3];    // asphalt
-  return [40 + (l - WATER0) * 8, 96 + (l - WATER0) * 10, 150 + (l - WATER0) * 16];              // water
+  if (l < SAND0) { const t = l / GRASS_N; return [70 + t * 30, 120 + (1 - t) * 40 + l * 3, 50 + t * 20]; }
+  if (l < ROCK0) return [186 - (l - SAND0) * 6, 168 - (l - SAND0) * 5, 120 - (l - SAND0) * 6];
+  if (l < ROAD0) return [128 + (l - ROCK0) * 4, 130 + (l - ROCK0) * 4, 136 + (l - ROCK0) * 3];
+  if (l < WATER0) return [54 + (l - ROAD0) * 3, 56 + (l - ROAD0) * 3, 62 + (l - ROAD0) * 3];
+  return [40 + (l - WATER0) * 8, 96 + (l - WATER0) * 10, 150 + (l - WATER0) * 16];
 }
-function tileNoise(l) {
-  if (l < SAND0) return 16;
-  if (l < ROCK0) return 14;
-  if (l < ROAD0) return 10;
-  if (l < WATER0) return 7;
-  return 18;
-}
+function tileNoise(l) { return l < SAND0 ? 16 : l < ROCK0 ? 14 : l < ROAD0 ? 10 : l < WATER0 ? 7 : 18; }
 function genTileArray() {
   const data = new Uint8Array(TILE * TILE * 4 * LAYERS);
   for (let l = 0; l < LAYERS; l++) {
     const base = tileBase(l), noise = tileNoise(l), off = l * TILE * TILE * 4;
     for (let p = 0; p < TILE * TILE; p++) {
       const n = (Math.random() * 2 - 1) * noise;
-      data[off + p * 4]     = clamp255(base[0] + n);
+      data[off + p * 4] = clamp255(base[0] + n);
       data[off + p * 4 + 1] = clamp255(base[1] + n);
       data[off + p * 4 + 2] = clamp255(base[2] + n);
       data[off + p * 4 + 3] = 255;
     }
-    // lane markings on a few road layers (centre dashed line)
     if (l >= ROAD0 && l <= ROAD0 + 3) {
       for (let y = 0; y < TILE; y++) {
-        if ((y >> 3) % 2 === 0) continue;             // dashes
-        for (let x = 30; x < 34; x++) {
-          const idx = off + (y * TILE + x) * 4;
-          data[idx] = 220; data[idx + 1] = 200; data[idx + 2] = 70;
-        }
+        if ((y >> 3) % 2 === 0) continue;
+        for (let x = 30; x < 34; x++) { const idx = off + (y * TILE + x) * 4; data[idx] = 220; data[idx + 1] = 200; data[idx + 2] = 70; }
       }
     }
   }
   const tex = new THREE.DataArrayTexture(data, TILE, TILE, LAYERS);
-  tex.format = THREE.RGBAFormat;
-  tex.type = THREE.UnsignedByteType;
+  tex.format = THREE.RGBAFormat; tex.type = THREE.UnsignedByteType;
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.magFilter = THREE.LinearFilter;
-  tex.minFilter = THREE.LinearMipmapLinearFilter;
-  tex.generateMipmaps = true;
-  tex.needsUpdate = true;
+  tex.magFilter = THREE.LinearFilter; tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true; tex.needsUpdate = true;
   return tex;
 }
 const tileArray = genTileArray();
 
 // ───────────────────────────── 3D prop geometry (~500-poly tree, box building) ────────────
 function addColor(geo, r, g, b) {
-  const n = geo.attributes.position.count;
-  const col = new Float32Array(n * 3);
+  const n = geo.attributes.position.count, col = new Float32Array(n * 3);
   for (let i = 0; i < n; i++) { col[i * 3] = r; col[i * 3 + 1] = g; col[i * 3 + 2] = b; }
   geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  if (geo.attributes.uv) geo.deleteAttribute('uv');           // keep merge attrs consistent
+  if (geo.attributes.uv) geo.deleteAttribute('uv');
   return geo;
 }
 function buildTreeGeometry() {
-  // trunk + three stacked cones, ~500 tris, vertex-coloured
   const trunk = addColor(new THREE.CylinderGeometry(0.06, 0.09, 0.55, 12).translate(0, 0.275, 0), 0.37, 0.25, 0.14);
   const c1 = addColor(new THREE.ConeGeometry(0.46, 0.6, 26, 2).translate(0, 0.7, 0), 0.17, 0.43, 0.19);
   const c2 = addColor(new THREE.ConeGeometry(0.35, 0.55, 26, 2).translate(0, 1.0, 0), 0.20, 0.47, 0.21);
@@ -236,18 +222,16 @@ function buildTreeGeometry() {
   g.computeVertexNormals();
   return g;
 }
-function buildBuildingGeometry() {
-  const box = new THREE.BoxGeometry(0.84, 1, 0.84).translate(0, 0.5, 0);  // base at y=0
-  return addColor(box, 0.66, 0.66, 0.69);
-}
 const treeGeo = buildTreeGeometry();
-const bldgGeo = buildBuildingGeometry();
+const bldgGeo = new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);   // base at y=0
 
-// ───────────────────────────── materials (state-texture driven) ──────────────────────────
-// Terrain: MeshLambert + onBeforeCompile -> sample the 32-layer texture array per tile.
+const terrainGeo = new THREE.PlaneGeometry(WORLD, WORLD);
+const dummy = new THREE.Object3D();
+const tmpColor = new THREE.Color();
+
+// ───────────────────────────── terrain material (32-texture atlas, lit, shadowed) ─────────
 function makeTerrainMat() {
   const m = new THREE.MeshLambertMaterial({ color: 0xffffff });
-  m.customProgramCacheKey = () => 'terrain';   // keep onBeforeCompile injections distinct per material
   m.onBeforeCompile = (sh) => {
     sh.uniforms.uState = { value: stateTex };
     sh.uniforms.uTiles = { value: tileArray };
@@ -263,99 +247,22 @@ function makeTerrainMat() {
         uniform sampler2D uState; uniform sampler2DArray uTiles;
         uniform float uN; uniform float uHalf; uniform float uWorld;`)
       .replace('#include <map_fragment>', `
-        vec2 uv01 = (vWXZ + uHalf) / uWorld;
-        vec2 cell = uv01 * uN;
-        vec2 id = floor(cell);
-        float layer = floor(texture(uState, (id + 0.5) / uN).r * 255.0 + 0.5);
-        vec4 tcol = texture(uTiles, vec3(fract(cell), layer));
-        diffuseColor.rgb *= tcol.rgb;`);
-  };
-  return m;
-}
-
-// shared GLSL: read this instance's tile + prop type from the state texture
-const PROP_DECL = `
-  uniform sampler2D uState; uniform float uN; attribute vec2 aTile;`;
-function treeVertex(begin) {
-  return begin
-    .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>
-      { vec4 _s = texture(uState, (aTile + 0.5) / uN); float _a = _s.b * 6.2831853;
-        objectNormal.xz = mat2(cos(_a), -sin(_a), sin(_a), cos(_a)) * objectNormal.xz; }`)
-    .replace('#include <begin_vertex>', `#include <begin_vertex>
-      vec4 _st = texture(uState, (aTile + 0.5) / uN);
-      float _prop = floor(_st.g * 255.0 + 0.5);
-      if (_prop < 0.5 || _prop > 1.5) { transformed = vec3(0.0); }
-      else {
-        float _h = _st.b; float _ang = _h * 6.2831853; float _sc = 0.75 + _h * 0.6;
-        transformed.xz = mat2(cos(_ang), -sin(_ang), sin(_ang), cos(_ang)) * transformed.xz;
-        transformed *= _sc;
-      }`);
-}
-function bldgVertex(begin) {
-  return begin.replace('#include <begin_vertex>', `#include <begin_vertex>
-      vec4 _st = texture(uState, (aTile + 0.5) / uN);
-      float _prop = floor(_st.g * 255.0 + 0.5);
-      if (_prop < 1.5 || _prop > 2.5) { transformed = vec3(0.0); }
-      else {
-        float _h = _st.b;
-        transformed.y *= mix(2.0, 11.0, _h);
-        transformed.xz *= mix(0.85, 1.0, fract(_h * 7.3));
-      }`);
-}
-function makePropMat(vertexFn, key) {
-  const m = new THREE.MeshLambertMaterial({ vertexColors: true });
-  m.customProgramCacheKey = () => key;
-  m.onBeforeCompile = (sh) => {
-    sh.uniforms.uState = { value: stateTex };
-    sh.uniforms.uN = { value: N };
-    sh.vertexShader = vertexFn(sh.vertexShader.replace('#include <common>', '#include <common>' + PROP_DECL));
-  };
-  return m;
-}
-function makePropDepth(vertexFn, key) {
-  const m = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
-  m.customProgramCacheKey = () => key;
-  m.onBeforeCompile = (sh) => {
-    sh.uniforms.uState = { value: stateTex };
-    sh.uniforms.uN = { value: N };
-    sh.vertexShader = vertexFn(sh.vertexShader.replace('#include <common>', '#include <common>' + PROP_DECL));
+        vec2 cell = ((vWXZ + uHalf) / uWorld) * uN;
+        float layer = floor(texture(uState, (floor(cell) + 0.5) / uN).r * 255.0 + 0.5);
+        diffuseColor.rgb *= texture(uTiles, vec3(fract(cell), layer)).rgb;`);
   };
   return m;
 }
 
 // ───────────────────────────── world build / scale switch ────────────────────────────────
-const terrainGeo = new THREE.PlaneGeometry(WORLD, WORLD);
-const dummy = new THREE.Object3D();
-
-function makeInstanced(baseGeo, mat, depthMat, n) {
-  const g = baseGeo.clone();
-  const aTile = new Float32Array(n * n * 2);
-  const inst = new THREE.InstancedMesh(g, mat, n * n);
-  for (let z = 0, i = 0; z < n; z++) {
-    for (let x = 0; x < n; x++, i++) {
-      aTile[i * 2] = x; aTile[i * 2 + 1] = z;
-      dummy.position.set(-HALF + (x + 0.5) * cellSize, 0, -HALF + (z + 0.5) * cellSize);
-      dummy.scale.setScalar(cellSize);
-      dummy.updateMatrix();
-      inst.setMatrixAt(i, dummy.matrix);
-    }
-  }
-  g.setAttribute('aTile', new THREE.InstancedBufferAttribute(aTile, 2));
-  inst.instanceMatrix.needsUpdate = true;
-  inst.castShadow = true;
-  inst.receiveShadow = true;
-  inst.frustumCulled = false;            // placement is done on the GPU
-  inst.customDepthMaterial = depthMat;   // shadows respect the same visibility logic
-  return inst;
-}
+function tileWX(x) { return -HALF + (x + 0.5) * cellSize; }
 
 function disposeWorld() {
   for (const m of [terrainMesh, treeMesh, bldgMesh]) {
     if (!m) continue;
     scene.remove(m);
-    if (m.geometry !== terrainGeo) m.geometry.dispose();
+    if (m.geometry !== terrainGeo && m.geometry !== treeGeo && m.geometry !== bldgGeo) m.geometry.dispose();
     m.material.dispose();
-    if (m.customDepthMaterial) m.customDepthMaterial.dispose();
   }
   if (stateTex) stateTex.dispose();
 }
@@ -363,12 +270,13 @@ function disposeWorld() {
 function createWorld(n) {
   disposeWorld();
   N = n; cellSize = WORLD / N;
+  propScale = Math.min(3.0, Math.max(0.55, cellSize));   // props ≈ tile-sized, clamped at extremes
 
-  stateData = new Uint8Array(n * n * 4);
-  fillCity(stateData, n);
-  stateTex = new THREE.DataTexture(stateData, n, n, THREE.RGBAFormat, THREE.UnsignedByteType);
+  stateData = new Uint8Array(n * n);                      // R8 terrain index per tile
+  stateTex = new THREE.DataTexture(stateData, n, n, THREE.RedFormat, THREE.UnsignedByteType);
   stateTex.magFilter = stateTex.minFilter = THREE.NearestFilter;
   stateTex.wrapS = stateTex.wrapT = THREE.ClampToEdgeWrapping;
+  stateTex.unpackAlignment = 1;
   stateTex.needsUpdate = true;
 
   terrainMesh = new THREE.Mesh(terrainGeo, makeTerrainMat());
@@ -377,46 +285,97 @@ function createWorld(n) {
   terrainMesh.frustumCulled = false;
   scene.add(terrainMesh);
 
-  treeMesh = makeInstanced(treeGeo, makePropMat(treeVertex, 'tree'), makePropDepth(treeVertex, 'tree-depth'), n);
-  bldgMesh = makeInstanced(bldgGeo, makePropMat(bldgVertex, 'bldg'), makePropDepth(bldgVertex, 'bldg-depth'), n);
+  treeMesh = new THREE.InstancedMesh(treeGeo, new THREE.MeshLambertMaterial({ vertexColors: true }), TREE_CAP);
+  bldgMesh = new THREE.InstancedMesh(bldgGeo, new THREE.MeshLambertMaterial(), BLDG_CAP);
+  for (const m of [treeMesh, bldgMesh]) { m.castShadow = true; m.receiveShadow = true; m.frustumCulled = false; m.count = 0; }
   scene.add(treeMesh, bldgMesh);
 
+  fillWorld();
   updateHudStatic();
 }
 
-// procedural starting scene: forest + central downtown + a lake
-function rnd(a, b) { return a + Math.random() * (b - a); }
-function setTile(arr, n, x, z, layer, prop, variant) {
-  const i = (z * n + x) * 4;
-  arr[i] = layer; arr[i + 1] = prop; arr[i + 2] = variant; arr[i + 3] = 255;
+// ── prop pool: place on edit, swap-remove on clear (reused matrices, no per-edit allocation) ─
+function setTreeInstance(idx, tile, variant) {
+  const x = tile % N, z = (tile / N) | 0, h = variant / 255;
+  dummy.position.set(tileWX(x), 0, tileWX(z));
+  dummy.rotation.set(0, h * Math.PI * 2, 0);
+  const s = propScale * (1.3 + h * 0.7);
+  dummy.scale.set(s, s, s);
+  dummy.updateMatrix();
+  treeMesh.setMatrixAt(idx, dummy.matrix);
+  treeTileOf[idx] = tile;
 }
-function fillCity(arr, n) {
-  const cx = n * 0.5, cz = n * 0.5;
-  const lakeX = n * 0.74, lakeZ = n * 0.30, lakeR = n * 0.12;
-  const town = Math.round(n * 0.22);                 // downtown half-extent
-  for (let z = 0; z < n; z++) {
-    for (let x = 0; x < n; x++) {
-      const dlx = x - lakeX, dlz = z - lakeZ;
-      const inLake = dlx * dlx + dlz * dlz < lakeR * lakeR;
-      const inTown = Math.abs(x - cx) < town && Math.abs(z - cz) < town;
-      if (inLake) { setTile(arr, n, x, z, WATER0 + (Math.random() < 0.5 ? 0 : 1), PROP.NONE, 0); continue; }
-      if (inTown) {
-        const lx = x - (cx - town), lz = z - (cz - town);
-        const onRoad = (lx % 5 === 0) || (lz % 5 === 0);
-        if (onRoad) { setTile(arr, n, x, z, ROAD0 + (Math.random() * 4 | 0), PROP.NONE, 0); }
-        else if (Math.random() < 0.55) {
-          const hv = Math.random();                                  // bias toward low-rise, few towers
-          setTile(arr, n, x, z, ROCK0 + (Math.random() * 6 | 0), PROP.BLDG, (hv * hv * 255) | 0);
-        } else {
-          setTile(arr, n, x, z, ROCK0 + (Math.random() * 6 | 0), Math.random() < 0.15 ? PROP.TREE : PROP.NONE, rnd(0, 255) | 0);
-        }
-        continue;
+function bldgColorFor(tile) {
+  const h = ((tile * 2654435761) >>> 0) % 1000 / 1000;
+  const g = 0.55 + 0.18 * h;
+  return tmpColor.setRGB(g * 0.93, g * 0.95, g);   // cool concrete gray
+}
+function setBldgInstance(idx, tile, variant) {
+  const x = tile % N, z = (tile / N) | 0, h = variant / 255;
+  dummy.position.set(tileWX(x), 0, tileWX(z));
+  dummy.rotation.set(0, (Math.floor(h * 4) * Math.PI / 2), 0);
+  // chunky footprint; mostly low-rise with the occasional tower (cubic height bias)
+  const foot = propScale * 0.92, height = propScale * (1.0 + h * h * h * 7.0);
+  dummy.scale.set(foot, height, foot);
+  dummy.updateMatrix();
+  bldgMesh.setMatrixAt(idx, dummy.matrix);
+  bldgMesh.setColorAt(idx, bldgColorFor(tile));
+  bldgTileOf[idx] = tile;
+}
+function addProp(tile, type, variant) {
+  removeProp(tile);
+  if (type === PROP.TREE && treeCount < TREE_CAP) {
+    const idx = treeCount++; setTreeInstance(idx, tile, variant); propAt.set(tile, { layer: 0, idx }); treeMesh.count = treeCount;
+  } else if (type === PROP.BLDG && bldgCount < BLDG_CAP) {
+    const idx = bldgCount++; setBldgInstance(idx, tile, variant); propAt.set(tile, { layer: 1, idx }); bldgMesh.count = bldgCount;
+  }
+}
+function removeProp(tile) {
+  const e = propAt.get(tile); if (!e) return;
+  if (e.layer === 0) {
+    const last = --treeCount;
+    if (e.idx !== last) {
+      treeMesh.getMatrixAt(last, dummy.matrix); treeMesh.setMatrixAt(e.idx, dummy.matrix);
+      const mt = treeTileOf[last]; treeTileOf[e.idx] = mt; propAt.get(mt).idx = e.idx;
+    }
+    treeMesh.count = treeCount;
+  } else {
+    const last = --bldgCount;
+    if (e.idx !== last) {
+      bldgMesh.getMatrixAt(last, dummy.matrix); bldgMesh.setMatrixAt(e.idx, dummy.matrix);
+      const mt = bldgTileOf[last]; bldgMesh.setColorAt(e.idx, bldgColorFor(mt)); bldgTileOf[e.idx] = mt; propAt.get(mt).idx = e.idx;
+    }
+    bldgMesh.count = bldgCount;
+  }
+  propAt.delete(tile);
+}
+function flushProps() {
+  treeMesh.instanceMatrix.needsUpdate = true;
+  bldgMesh.instanceMatrix.needsUpdate = true;
+  if (bldgMesh.instanceColor) bldgMesh.instanceColor.needsUpdate = true;
+}
+
+// starting scene: textured terrain + a lake, with ~5% of land covered by trees & buildings
+function rb() { return Math.random() * 255 | 0; }
+function fillWorld() {
+  treeCount = 0; bldgCount = 0; propAt.clear();
+  treeMesh.count = 0; bldgMesh.count = 0;
+  const lakeX = N * 0.72, lakeZ = N * 0.30, lakeR = N * 0.11, lakeR2 = lakeR * lakeR;
+  const p = Math.min(0.05, (TREE_CAP + BLDG_CAP) / (N * N));   // 5%, capped so big grids stay bounded
+  for (let z = 0; z < N; z++) {
+    for (let x = 0; x < N; x++) {
+      const tile = z * N + x;
+      const dx = x - lakeX, dz = z - lakeZ;
+      if (dx * dx + dz * dz < lakeR2) { stateData[tile] = WATER0 + (Math.random() < 0.5 ? 0 : 1); continue; }
+      stateData[tile] = GRASS0 + (Math.random() * GRASS_N | 0);
+      if (Math.random() < p) {
+        if (Math.random() < 0.82) addProp(tile, PROP.TREE, rb());
+        else { stateData[tile] = ROCK0 + (Math.random() * 6 | 0); addProp(tile, PROP.BLDG, rb()); }
       }
-      // open country: grass with ~10% trees
-      const tree = Math.random() < 0.10;
-      setTile(arr, n, x, z, GRASS0 + (Math.random() * GRASS_N | 0), tree ? PROP.TREE : PROP.NONE, rnd(0, 255) | 0);
     }
   }
+  stateTex.needsUpdate = true;
+  flushProps();
 }
 
 // ───────────────────────────── picking (ray vs y=0 plane) ────────────────────────────────
@@ -433,17 +392,17 @@ function tileAt(cx, cy) {
   return (tx < 0 || tz < 0 || tx >= N || tz >= N) ? null : { tx, tz };
 }
 
-// ───────────────────────────── editing (write the state texture) ─────────────────────────
+// ───────────────────────────── editing ─────────────────────────────
 let editsThisSec = 0;
 function applyTool(x, z) {
-  const i = (z * N + x) * 4;
+  const tile = z * N + x;
   switch (currentTool) {
-    case 'tree':  stateData[i] = GRASS0 + (Math.random() * GRASS_N | 0); stateData[i + 1] = PROP.TREE; stateData[i + 2] = Math.random() * 255 | 0; break;
-    case 'bldg':  stateData[i] = ROCK0 + (Math.random() * 6 | 0);        stateData[i + 1] = PROP.BLDG; stateData[i + 2] = (Math.random() ** 2 * 255) | 0; break;
-    case 'road':  stateData[i] = ROAD0 + (Math.random() * 4 | 0);        stateData[i + 1] = PROP.NONE; break;
-    case 'grass': stateData[i] = GRASS0 + (Math.random() * GRASS_N | 0); stateData[i + 1] = PROP.NONE; break;
-    case 'water': stateData[i] = WATER0 + (Math.random() < 0.5 ? 0 : 1); stateData[i + 1] = PROP.NONE; break;
-    case 'clear': stateData[i + 1] = PROP.NONE; break;
+    case 'tree':  stateData[tile] = GRASS0 + (Math.random() * GRASS_N | 0); addProp(tile, PROP.TREE, rb()); break;
+    case 'bldg':  stateData[tile] = ROCK0 + (Math.random() * 6 | 0);        addProp(tile, PROP.BLDG, rb()); break;
+    case 'road':  stateData[tile] = ROAD0 + (Math.random() * 4 | 0);        removeProp(tile); break;
+    case 'grass': stateData[tile] = GRASS0 + (Math.random() * GRASS_N | 0); removeProp(tile); break;
+    case 'water': stateData[tile] = WATER0 + (Math.random() < 0.5 ? 0 : 1); removeProp(tile); break;
+    case 'clear': removeProp(tile); break;
   }
   editsThisSec++;
 }
@@ -451,30 +410,26 @@ function paintRegion(txc, tzc) {
   const x0 = Math.max(0, txc - (brush >> 1)), z0 = Math.max(0, tzc - (brush >> 1));
   const x1 = Math.min(N, x0 + brush), z1 = Math.min(N, z0 + brush);
   for (let z = z0; z < z1; z++) for (let x = x0; x < x1; x++) applyTool(x, z);
-  stateTex.needsUpdate = true;                 // one re-upload of the small state texture
+  stateTex.needsUpdate = true;    // small terrain re-upload
+  flushProps();
 }
 
-// stress: randomly mutate 5% of tiles every frame (no instance buffers touched)
+// stress: randomize 5% (capped) of terrain tiles every frame — scales because it's a texture write
 function stressStep() {
-  const k = Math.floor(N * N * 0.05);
+  const k = Math.min((N * N * 0.05) | 0, STRESS_MAX);
   for (let j = 0; j < k; j++) {
-    const x = Math.random() * N | 0, z = Math.random() * N | 0, i = (z * N + x) * 4;
-    const r = Math.random();
-    stateData[i] = GRASS0 + (Math.random() * GRASS_N | 0);
-    stateData[i + 1] = r < 0.1 ? PROP.TREE : (r < 0.13 ? PROP.BLDG : PROP.NONE);
-    stateData[i + 2] = Math.random() * 255 | 0;
+    const t = (Math.random() * N * N) | 0;
+    stateData[t] = GRASS0 + (Math.random() * GRASS_N | 0);
   }
   editsThisSec += k;
   stateTex.needsUpdate = true;
 }
 
-// ───────────────────────────── pointer (click vs orbit-drag) + hover ─────────────────────
+// ───────────────────────────── pointer (click vs orbit-drag) ─────────────────────────────
 let downX = 0, downY = 0, moved = false;
 const dom = renderer.domElement;
 dom.addEventListener('pointerdown', (e) => { if (e.button === 0) { downX = e.clientX; downY = e.clientY; moved = false; } });
-dom.addEventListener('pointermove', (e) => {
-  if (Math.abs(e.clientX - downX) > 5 || Math.abs(e.clientY - downY) > 5) moved = true;
-});
+dom.addEventListener('pointermove', (e) => { if (Math.abs(e.clientX - downX) > 5 || Math.abs(e.clientY - downY) > 5) moved = true; });
 dom.addEventListener('pointerup', (e) => {
   if (e.button !== 0 || moved) return;
   const t = tileAt(e.clientX, e.clientY);
@@ -496,6 +451,18 @@ document.querySelectorAll('#scales button').forEach((b) => b.addEventListener('c
 const stressBtn = document.getElementById('stressBtn');
 stressBtn.addEventListener('click', () => { stress = !stress; stressBtn.classList.toggle('on', stress); });
 
+let shadows = true;
+const shadowBtn = document.getElementById('shadowBtn');
+function setShadows(on) {
+  shadows = on;
+  renderer.shadowMap.enabled = on;                 // skips the whole shadow pass when off
+  renderer.shadowMap.needsUpdate = true;
+  for (const m of [terrainMesh, treeMesh, bldgMesh]) if (m) m.material.needsUpdate = true;  // recompile w/o shadow code
+  shadowBtn.classList.toggle('active', on);
+  shadowBtn.textContent = on ? 'on' : 'off';
+}
+shadowBtn.addEventListener('click', () => setShadows(!shadows));
+
 const loadingEl = document.getElementById('loading');
 function switchScale(n) {
   if (n === N) return;
@@ -503,9 +470,10 @@ function switchScale(n) {
   requestAnimationFrame(() => requestAnimationFrame(() => { createWorld(n); syncButtons(); loadingEl.style.display = 'none'; }));
 }
 window.addEventListener('keydown', (e) => {
-  if (e.key >= '1' && e.key <= '3') switchScale(SCALES[+e.key - 1]);
+  if (e.key >= '1' && e.key <= '5') switchScale(SCALES[+e.key - 1]);
   else if (e.key === 'z' || e.key === 'Z') zoomBy(0.9);
   else if (e.key === 'x' || e.key === 'X') zoomBy(1.1);
+  else if (e.key === 'h' || e.key === 'H') setShadows(!shadows);
   else if (e.key === 's' || e.key === 'S') { stress = !stress; stressBtn.classList.toggle('on', stress); }
 });
 const camOffset = new THREE.Vector3();
@@ -521,7 +489,7 @@ const elCalls = document.getElementById('hud-calls');
 const elFps = document.getElementById('hud-fps');
 const elGrid = document.getElementById('hud-grid');
 const elTiles = document.getElementById('hud-tiles');
-const elTrees = document.getElementById('hud-trees');
+const elProps = document.getElementById('hud-props');
 const elEdits = document.getElementById('hud-edits');
 const spark = document.getElementById('spark');
 const sctx = spark.getContext('2d');
@@ -530,7 +498,6 @@ let ftIdx = 0;
 function updateHudStatic() {
   elGrid.textContent = N + '×' + N;
   elTiles.textContent = (N * N).toLocaleString();
-  elTrees.textContent = (N * N).toLocaleString();   // capacity (one per tile, GPU-culled)
 }
 function drawSpark() {
   const w = spark.width, h = spark.height;
@@ -538,11 +505,7 @@ function drawSpark() {
   const ty = h - Math.min(8.33 / 33.3, 1) * h;
   sctx.strokeStyle = 'rgba(90,210,139,0.35)'; sctx.beginPath(); sctx.moveTo(0, ty); sctx.lineTo(w, ty); sctx.stroke();
   sctx.strokeStyle = '#7fb2ff'; sctx.beginPath();
-  for (let i = 0; i < w; i++) {
-    const ms = ftHist[(ftIdx + i) % w];
-    const y = h - Math.min(ms / 33.3, 1) * h;
-    i === 0 ? sctx.moveTo(i, y) : sctx.lineTo(i, y);
-  }
+  for (let i = 0; i < w; i++) { const ms = ftHist[(ftIdx + i) % w]; const y = h - Math.min(ms / 33.3, 1) * h; i === 0 ? sctx.moveTo(i, y) : sctx.lineTo(i, y); }
   sctx.stroke();
 }
 
@@ -563,8 +526,9 @@ function frame(now) {
   if (hudAccum >= 200) {
     hudAccum = 0;
     elCalls.textContent = calls;
-    elCalls.className = 'v ' + (calls < 100 ? 'ok' : 'warn');   // budget: keep it under ~100
+    elCalls.className = 'v ' + (calls < 100 ? 'ok' : 'warn');
     elFps.textContent = fpsSmooth.toFixed(0);
+    elProps.textContent = treeCount.toLocaleString() + ' / ' + bldgCount.toLocaleString();
     elEdits.textContent = edps.toLocaleString();
   }
 }
@@ -576,7 +540,7 @@ window.addEventListener('resize', () => {
 });
 
 // boot
-createWorld(128);
+createWorld(256);
 syncButtons();
 loadingEl.style.display = 'none';
 requestAnimationFrame(frame);
