@@ -33,7 +33,7 @@
   }
   .btns button:hover { background:rgba(255,255,255,0.15); }
   .btns button.active { background:var(--ok); color:#06250f; border-color:var(--ok); }
-  #stressBtn.on { background:var(--warn); color:#3a2400; border-color:var(--warn); }
+  #stressBtn.on, #sunBtn.on { background:var(--warn); color:#3a2400; border-color:var(--warn); }
   .hint { font-size:10.5px; color:var(--dim); margin-top:10px; line-height:15px; }
   #loading {
     position:fixed; inset:0; z-index:20; display:flex; align-items:center; justify-content:center;
@@ -88,12 +88,13 @@
     <div class="grp-label">SHADOWS</div>
     <div class="btns">
       <button id="shadowBtn" class="active">on</button>
+      <button id="sunBtn">sun: static</button>
     </div>
     <div class="grp-label">STRESS TEST</div>
     <div class="btns">
       <button id="stressBtn">randomize 5% of tiles / frame</button>
     </div>
-    <div class="hint">pick a tool + size, click to paint · drag: rotate<br>arrows: pan · Z/X: zoom · 1–5: grid · H: shadows · S: stress</div>
+    <div class="hint">pick a tool + size, click to paint · drag: rotate<br>arrows: pan · Z/X: zoom · 1–5: grid · H: shadows · U: sun · S: stress</div>
   </div>
 
   <div id="loading">building world…</div>
@@ -466,6 +467,19 @@ function setShadows(on) {
 }
 shadowBtn.addEventListener('click', () => setShadows(!shadows));
 
+// animated sun: orbit the sun each frame -> real-time moving shadows (re-renders the shadow map every frame)
+let sunMoving = false;
+const SUN_R = Math.hypot(0.5, 0.32) * WORLD, SUN_H = WORLD * 0.42;
+let sunAngle = Math.atan2(0.32, 0.5);   // start at the static sun's azimuth (no snap)
+const sunBtn = document.getElementById('sunBtn');
+function setSun(on) {
+  sunMoving = on;
+  sunBtn.classList.toggle('on', on);
+  sunBtn.textContent = on ? 'sun: moving' : 'sun: static';
+  if (!on) renderer.shadowMap.needsUpdate = true;   // settle the now-static shadow map once
+}
+sunBtn.addEventListener('click', () => setSun(!sunMoving));
+
 const loadingEl = document.getElementById('loading');
 function switchScale(n) {
   if (n === N) return;
@@ -477,6 +491,7 @@ window.addEventListener('keydown', (e) => {
   else if (e.key === 'z' || e.key === 'Z') zoomBy(0.9);
   else if (e.key === 'x' || e.key === 'X') zoomBy(1.1);
   else if (e.key === 'h' || e.key === 'H') setShadows(!shadows);
+  else if (e.key === 'u' || e.key === 'U') setSun(!sunMoving);
   else if (e.key === 's' || e.key === 'S') { stress = !stress; stressBtn.classList.toggle('on', stress); }
 });
 const camOffset = new THREE.Vector3();
@@ -517,6 +532,11 @@ function frame(now) {
   requestAnimationFrame(frame);
   const dt = now - prev; prev = now;
   if (stress) stressStep();
+  if (sunMoving) {                                   // orbit the sun -> shadows update in real time
+    sunAngle += dt * 0.0004;
+    sun.position.set(Math.cos(sunAngle) * SUN_R, SUN_H, Math.sin(sunAngle) * SUN_R);
+    renderer.shadowMap.needsUpdate = true;           // re-render the shadow map this frame
+  }
   controls.update();
   renderer.render(scene, camera);
 

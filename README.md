@@ -46,6 +46,7 @@ Builds the scene structure against a stubbed WebGL2 context and asserts the **ma
 | **BUILD** buttons | Tree / Bldg / Road / Grass / Water / Clear |
 | **BRUSH** buttons | Footprint: 1×1 / 4×4 / 16×16 tiles |
 | **SHADOWS** button (or **H**) | Toggle sun shadows (off skips the whole shadow pass — a free FPS win) |
+| **sun: static/moving** button (or **U**) | Animate the sun — orbits each frame so shadows update in real time (re-renders the shadow map every frame; costs FPS, especially at large grids) |
 | **STRESS** button (or **S**) | Randomize 5% of tiles every frame |
 | **Drag** rotate · **Arrows** pan · **Z/X** or scroll zoom | camera |
 | **1–5** | Grid size 64 / 256 / 1024 / 2048 / 4096 |
@@ -55,7 +56,7 @@ The HUD shows live draw calls, FPS + sparkline, grid/tile counts, live tree/buil
 ## Notes & limits
 
 - **Trees and buildings are 3D; the terrain stays flat** (the requested design).
-- **Shadows are the dominant cost.** Cast shadows roughly double the frame time (a fixed, prop-count-independent fragment cost — it's the shadow-map sampling, not geometry). The map uses `PCFShadowMap` (cheaper than `PCFSoftShadowMap`) and is **static** (`shadowMap.autoUpdate = false`, re-rendered only on edits, since a directional shadow map is camera-independent). Turn shadows off (the **H** key) for max FPS.
+- **Shadows are the dominant cost.** Cast shadows roughly double the frame time (a fixed, prop-count-independent fragment cost — it's the shadow-map sampling, not geometry). The map uses `PCFShadowMap` (cheaper than `PCFSoftShadowMap`) and is **static** by default (`shadowMap.autoUpdate = false`, re-rendered only on edits, since a directional shadow map is camera-independent). Turn shadows off (the **H** key) for max FPS. The **sun: moving** toggle re-renders the shadow map every frame (real-time moving shadows) — the cost of that scales with prop count, so it's most noticeable at 1024²+.
 - **"120 fps" is vsync-bound.** If a machine shows an oddly low cap (e.g. exactly 30), suspect a power-saver rAF cap, a 30 Hz display mode, or Chrome using the integrated GPU instead of the discrete one (check `chrome://gpu`) — not the workload.
 - The earlier **flat, single-draw-call, no-props** terrain (which scaled to 4096² at 1 draw call) is preserved in git history.
 
