@@ -75,10 +75,41 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-import { Fn, instanceIndex, storage, uniform, float, positionLocal, If } from 'three/tsl';
+import { Fn, instanceIndex, storage, uniform, float, positionLocal, If, texture, positionWorld, vec3 } from 'three/tsl';
 
 const WORLD = 200, HALF = WORLD / 2;
 const TREES = 60000, BLDGS = 12000;
+const LAYERS = 32, TILE = 64, NT = 256;   // terrain: 32-texture atlas, 256x256 tile grid
+const GRASS0 = 0, GRASS_N = 12, SAND0 = 12, ROCK0 = 18, ROAD0 = 24, WATER0 = 30;
+
+// 32 procedural tile textures -> a DataArrayTexture (sampler2DArray), same as the WebGL2 demo
+function clamp255(v) { return v < 0 ? 0 : v > 255 ? 255 : v | 0; }
+function tileBase(l) {
+  if (l < SAND0) { const t = l / GRASS_N; return [70 + t*30, 120 + (1-t)*40 + l*3, 50 + t*20]; }
+  if (l < ROCK0) return [186 - (l-SAND0)*6, 168 - (l-SAND0)*5, 120 - (l-SAND0)*6];
+  if (l < ROAD0) return [128 + (l-ROCK0)*4, 130 + (l-ROCK0)*4, 136 + (l-ROCK0)*3];
+  if (l < WATER0) return [54 + (l-ROAD0)*3, 56 + (l-ROAD0)*3, 62 + (l-ROAD0)*3];
+  return [40 + (l-WATER0)*8, 96 + (l-WATER0)*10, 150 + (l-WATER0)*16];
+}
+function genTileArray() {
+  const data = new Uint8Array(TILE*TILE*4*LAYERS);
+  for (let l = 0; l < LAYERS; l++) {
+    const base = tileBase(l), noise = l < SAND0 ? 16 : l < ROAD0 ? 12 : l < WATER0 ? 7 : 18, off = l*TILE*TILE*4;
+    for (let p = 0; p < TILE*TILE; p++) {
+      const n = (Math.random()*2-1)*noise;
+      data[off+p*4] = clamp255(base[0]+n); data[off+p*4+1] = clamp255(base[1]+n);
+      data[off+p*4+2] = clamp255(base[2]+n); data[off+p*4+3] = 255;
+    }
+    if (l >= ROAD0 && l <= ROAD0+3) for (let y = 0; y < TILE; y++) { if ((y>>3)%2===0) continue;
+      for (let x = 30; x < 34; x++) { const i = off+(y*TILE+x)*4; data[i]=220; data[i+1]=200; data[i+2]=70; } }
+  }
+  const tex = new THREE.DataArrayTexture(data, TILE, TILE, LAYERS);
+  tex.format = THREE.RGBAFormat; tex.type = THREE.UnsignedByteType;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter; tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true; tex.needsUpdate = true;
+  return tex;
+}
 
 const params = new URLSearchParams(location.search);
 const forceGL = params.get('gl') === '1';
@@ -129,9 +160,31 @@ sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.05;
 scene.add(sun, sun.target);
 scene.add(new THREE.HemisphereLight(0xbfe0ff, 0x55692f, 0.55));
 
-// ground
-const ground = new THREE.Mesh(new THREE.PlaneGeometry(WORLD, WORLD),
-  new THREE.MeshLambertNodeMaterial({ color: 0x6f9c46 }));
+// ── textured terrain: per-tile index in an R8 state texture, colour from a 32-layer atlas (TSL) ──
+const tileArrayTex = genTileArray();
+const stateData = new Uint8Array(NT * NT);
+(function fillState() {
+  const lakeX = NT*0.72, lakeZ = NT*0.30, lr2 = (NT*0.11)*(NT*0.11);
+  for (let z = 0; z < NT; z++) for (let x = 0; x < NT; x++) {
+    const t = z*NT + x, dx = x-lakeX, dz = z-lakeZ;
+    if (dx*dx+dz*dz < lr2) { stateData[t] = WATER0 + (Math.random()<0.5?0:1); continue; }
+    if (x % 12 === 0 || z % 12 === 0) { stateData[t] = ROAD0 + (Math.random()*4|0); continue; }
+    stateData[t] = GRASS0 + (Math.random()*GRASS_N|0);
+  }
+})();
+const stateTex = new THREE.DataTexture(stateData, NT, NT, THREE.RedFormat, THREE.UnsignedByteType);
+stateTex.magFilter = stateTex.minFilter = THREE.NearestFilter;
+stateTex.wrapS = stateTex.wrapT = THREE.ClampToEdgeWrapping;
+stateTex.unpackAlignment = 1; stateTex.needsUpdate = true;
+
+const terrainMat = new THREE.MeshLambertNodeMaterial();
+{
+  const cell = positionWorld.xz.add(HALF).div(WORLD).mul(NT);   // tile-space coord
+  const id = cell.floor();
+  const layer = texture(stateTex, id.add(0.5).div(NT)).r.mul(255).round();   // terrain index 0..31
+  terrainMat.colorNode = texture(tileArrayTex, cell.fract()).depth(layer);   // sample that atlas layer
+}
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(WORLD, WORLD), terrainMat);
 ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true;
 scene.add(ground);
 
