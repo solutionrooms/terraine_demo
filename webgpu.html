@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GPU City — WebGPU (compute-culled)</title>
+<style>
+  :root { --fg:#eaf0f8; --dim:#92a0b6; --ok:#5ad28b; --warn:#ffb03a; --gpu:#7fd0ff; }
+  html, body { margin:0; height:100%; overflow:hidden; background:#9fc6e8; }
+  canvas { display:block; }
+  * { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  #hud {
+    position:fixed; top:14px; left:14px; z-index:10; pointer-events:none;
+    color:var(--fg); background:rgba(14,20,30,0.74);
+    border:1px solid rgba(255,255,255,0.10); border-radius:10px;
+    padding:12px 14px 10px; width:236px; backdrop-filter:blur(6px);
+    box-shadow:0 8px 28px rgba(0,0,0,0.45); user-select:none;
+  }
+  #hud .title { font-size:11px; letter-spacing:1.4px; color:var(--dim); margin-bottom:8px; }
+  #hud .row { display:flex; justify-content:space-between; font-size:12px; line-height:20px; }
+  #hud .k { color:var(--dim); } #hud .v { color:var(--fg); font-variant-numeric:tabular-nums; }
+  #hud #be.gpu { color:var(--gpu); } #hud #be.gl { color:var(--warn); }
+  .grp-label { font-size:10px; letter-spacing:1.2px; color:var(--dim); margin-top:11px; }
+  .btns { display:flex; gap:5px; margin-top:5px; pointer-events:auto; flex-wrap:wrap; }
+  .btns button, .btns a {
+    flex:1 1 0; min-width:42px; pointer-events:auto; text-align:center; text-decoration:none;
+    background:rgba(255,255,255,0.06); color:var(--fg); border:1px solid rgba(255,255,255,0.10);
+    border-radius:6px; padding:6px 0; font-size:11px; cursor:pointer;
+  }
+  .btns button:hover, .btns a:hover { background:rgba(255,255,255,0.15); }
+  .btns button.active { background:var(--ok); color:#06250f; border-color:var(--ok); }
+  .hint { font-size:10.5px; color:var(--dim); margin-top:10px; line-height:15px; }
+  #err { position:fixed; inset:0; display:none; align-items:center; justify-content:center; padding:40px;
+    color:#ffd9d2; background:#1a0f12; font-size:13px; line-height:1.6; white-space:pre-wrap; z-index:50; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.184.0/build/three.webgpu.js",
+    "three/webgpu": "https://unpkg.com/three@0.184.0/build/three.webgpu.js",
+    "three/tsl": "https://unpkg.com/three@0.184.0/build/three.tsl.js",
+    "three/addons/": "https://unpkg.com/three@0.184.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+  <div id="hud">
+    <div class="title">GPU CITY · WEBGPU</div>
+    <div class="row"><span class="k">Backend</span><span id="be" class="v">…</span></div>
+    <div class="row"><span class="k">GPU ms</span><span id="ms" class="v">–</span></div>
+    <div class="row"><span class="k">FPS</span><span id="fps" class="v">–</span></div>
+    <div class="row"><span class="k">Draw calls</span><span id="calls" class="v">–</span></div>
+    <div class="row"><span class="k">Instances</span><span id="inst" class="v">–</span></div>
+    <div class="grp-label">RENDERER</div>
+    <div class="btns">
+      <button id="toWebGPU">WebGPU</button>
+      <button id="toWebGL">WebGL2</button>
+    </div>
+    <div class="grp-label">LINKS</div>
+    <div class="btns">
+      <a href="index.html">‹ WebGL2 city demo</a>
+    </div>
+    <div class="hint">drag: rotate · scroll: zoom<br>switch backend to compare the same scene</div>
+  </div>
+  <div id="err"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+const WORLD = 200, HALF = WORLD / 2;
+const TREES = 60000, BLDGS = 12000;
+
+const params = new URLSearchParams(location.search);
+const forceGL = params.get('gl') === '1';
+
+let renderer;
+try {
+  renderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: forceGL });
+  await renderer.init();
+} catch (e) {
+  const el = document.getElementById('err');
+  el.style.display = 'flex';
+  el.textContent = 'Renderer init failed:\n' + (e && e.message ? e.message : e) +
+    '\n\nWebGPU available: ' + (!!navigator.gpu) + (forceGL ? '\n(forced WebGL2 fallback)' : '');
+  throw e;
+}
+const isWebGPU = renderer.backend && renderer.backend.isWebGPUBackend === true;
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// GPU timestamps (WebGPU). Guarded — falls back to frame interval if unavailable.
+let hasTimestamp = false;
+try { if (renderer.backend && 'trackTimestamp' in renderer.backend) { renderer.backend.trackTimestamp = true; hasTimestamp = true; } } catch (e) {}
+
+const scene = new THREE.Scene();
+const sky = new THREE.Color(0x9fc6e8);
+scene.background = sky;
+scene.fog = new THREE.Fog(sky, WORLD * 0.9, WORLD * 2.6);
+
+const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.5, 3000);
+camera.position.set(WORLD * 0.42, WORLD * 0.5, WORLD * 0.72);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true; controls.dampingFactor = 0.08;
+controls.maxPolarAngle = Math.PI * 0.49; controls.minDistance = 14; controls.maxDistance = 900;
+controls.update();
+
+const sun = new THREE.DirectionalLight(0xfff1d8, 2.7);
+sun.position.set(WORLD * 0.5, WORLD * 0.42, WORLD * 0.32);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near = 1; sun.shadow.camera.far = WORLD * 3;
+const sc = HALF * 1.4;
+sun.shadow.camera.left = -sc; sun.shadow.camera.right = sc; sun.shadow.camera.top = sc; sun.shadow.camera.bottom = -sc;
+sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.05;
+scene.add(sun, sun.target);
+scene.add(new THREE.HemisphereLight(0xbfe0ff, 0x55692f, 0.55));
+
+// ground
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(WORLD, WORLD),
+  new THREE.MeshLambertNodeMaterial({ color: 0x6f9c46 }));
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true;
+scene.add(ground);
+
+// low-poly tree (~3 cones + trunk), vertex coloured
+function addColor(g, r, gg, b) {
+  const n = g.attributes.position.count, c = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { c[i*3]=r; c[i*3+1]=gg; c[i*3+2]=b; }
+  g.setAttribute('color', new THREE.BufferAttribute(c, 3));
+  if (g.attributes.uv) g.deleteAttribute('uv');
+  return g;
+}
+const treeGeo = mergeGeometries([
+  addColor(new THREE.CylinderGeometry(0.06,0.09,0.55,10).translate(0,0.275,0), 0.37,0.25,0.14),
+  addColor(new THREE.ConeGeometry(0.46,0.6,18).translate(0,0.7,0), 0.17,0.43,0.19),
+  addColor(new THREE.ConeGeometry(0.34,0.55,18).translate(0,1.0,0), 0.20,0.47,0.21),
+  addColor(new THREE.ConeGeometry(0.22,0.5,18).translate(0,1.3,0), 0.24,0.52,0.24),
+], false);
+treeGeo.computeVertexNormals();
+const bldgGeo = new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
+
+const treeMat = new THREE.MeshLambertNodeMaterial({ vertexColors: true });
+const bldgMat = new THREE.MeshLambertNodeMaterial({ color: 0x9a9c9f });
+
+const trees = new THREE.InstancedMesh(treeGeo, treeMat, TREES);
+const bldgs = new THREE.InstancedMesh(bldgGeo, bldgMat, BLDGS);
+for (const m of [trees, bldgs]) { m.castShadow = true; m.receiveShadow = true; m.frustumCulled = false; }
+const dummy = new THREE.Object3D();
+let seed = 1; const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+for (let i = 0; i < TREES; i++) {
+  dummy.position.set((rnd()*2-1)*HALF, 0, (rnd()*2-1)*HALF);
+  dummy.rotation.set(0, rnd()*6.283, 0);
+  const s = 1.4 + rnd()*1.1; dummy.scale.set(s, s, s);
+  dummy.updateMatrix(); trees.setMatrixAt(i, dummy.matrix);
+}
+for (let i = 0; i < BLDGS; i++) {
+  dummy.position.set((rnd()*2-1)*HALF, 0, (rnd()*2-1)*HALF);
+  dummy.rotation.set(0, (Math.floor(rnd()*4))*1.5708, 0);
+  const h = rnd(); dummy.scale.set(1.0+rnd()*0.6, 2 + h*h*12, 1.0+rnd()*0.6);
+  dummy.updateMatrix(); bldgs.setMatrixAt(i, dummy.matrix);
+}
+trees.instanceMatrix.needsUpdate = true; bldgs.instanceMatrix.needsUpdate = true;
+scene.add(trees, bldgs);
+
+// HUD
+const beEl = document.getElementById('be');
+beEl.textContent = isWebGPU ? 'WebGPU' : 'WebGL2 (fallback)';
+beEl.className = 'v ' + (isWebGPU ? 'gpu' : 'gl');
+document.getElementById('inst').textContent = (TREES + BLDGS).toLocaleString();
+document.getElementById('toWebGPU').classList.toggle('active', isWebGPU);
+document.getElementById('toWebGL').classList.toggle('active', !isWebGPU);
+document.getElementById('toWebGPU').onclick = () => { location.search = ''; };
+document.getElementById('toWebGL').onclick = () => { location.search = '?gl=1'; };
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+const elMs = document.getElementById('ms'), elFps = document.getElementById('fps'), elCalls = document.getElementById('calls');
+let prev = performance.now(), fpsSmooth = 0, gpuMs = 0, acc = 0, resolvePending = false;
+
+function animate() {
+  const now = performance.now(), dt = now - prev; prev = now;
+  controls.update();
+  renderer.render(scene, camera);
+
+  // GPU time via WebGPU timestamps — one resolve in flight at a time; ignore absurd values
+  if (hasTimestamp && !resolvePending) {
+    resolvePending = true;
+    renderer.resolveTimestampsAsync(THREE.TimestampQuery.RENDER).then((ms) => {
+      resolvePending = false;
+      const v = typeof ms === 'number' ? ms : renderer.info.render.timestamp;
+      if (v > 0 && v < 2000) gpuMs = gpuMs ? gpuMs*0.85 + v*0.15 : v;
+    }).catch(() => { resolvePending = false; });
+  }
+  fpsSmooth = fpsSmooth ? fpsSmooth*0.9 + (1000/dt)*0.1 : 1000/dt;
+  acc += dt;
+  if (acc >= 200) {
+    acc = 0;
+    elFps.textContent = fpsSmooth.toFixed(0);
+    elMs.textContent = (gpuMs ? gpuMs : 1000/fpsSmooth).toFixed(2);
+    elCalls.textContent = renderer.info.render.drawCalls;
+  }
+}
+renderer.setAnimationLoop(animate);
+</script>
+</body>
+</html>

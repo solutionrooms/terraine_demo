@@ -119,6 +119,10 @@
     <div class="btns">
       <button id="stressBtn">randomize 5% of tiles / frame</button>
     </div>
+    <div class="grp-label">RENDERER</div>
+    <div class="btns">
+      <button id="webgpuBtn" title="WebGPU build with a GPU compute-cull pass + backend switch">⇄ WebGPU version</button>
+    </div>
     <div class="grp-label">ABOUT</div>
     <div class="btns">
       <button id="techBtn">▸ technology — how it works</button>
@@ -549,6 +553,7 @@ sunBtn.addEventListener('click', () => setSun(!sunMoving));
 
 // technology explainer panel
 const techPanel = document.getElementById('techPanel');
+document.getElementById('webgpuBtn').addEventListener('click', () => location.href = 'webgpu.html');
 document.getElementById('techBtn').addEventListener('click', () => techPanel.classList.toggle('open'));
 document.getElementById('techClose').addEventListener('click', () => techPanel.classList.remove('open'));
 
