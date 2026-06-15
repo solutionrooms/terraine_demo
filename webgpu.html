@@ -53,7 +53,15 @@
     <div class="row"><span class="k">Draw calls</span><span id="calls" class="v">–</span></div>
     <div class="row"><span class="k">Instances</span><span id="inst" class="v">–</span></div>
     <div class="row"><span class="k">Drawn (visible)</span><span id="drawn" class="v">–</span></div>
+    <div class="row"><span class="k">Tree polys</span><span id="poly" class="v">–</span></div>
+    <div class="row"><span class="k">Tree tris (total)</span><span id="polyTot" class="v">–</span></div>
     <div class="row"><span class="k">GPU cull</span><span id="cull" class="v">–</span></div>
+    <div class="grp-label">TREE DETAIL — polys / tree</div>
+    <div class="btns">
+      <input id="polyInput" type="number" value="500" min="24" max="60000" step="100"
+        style="flex:2; pointer-events:auto; background:rgba(255,255,255,0.06); color:var(--fg); border:1px solid rgba(255,255,255,0.10); border-radius:6px; padding:6px 8px; font-size:11px; min-width:60px;" />
+      <button id="polyBtn">rebuild</button>
+    </div>
     <div class="grp-label">RENDERER</div>
     <div class="btns">
       <button id="toWebGPU">WebGPU</button>
@@ -196,13 +204,21 @@ function addColor(g, r, gg, b) {
   if (g.attributes.uv) g.deleteAttribute('uv');
   return g;
 }
-const treeGeo = mergeGeometries([
-  addColor(new THREE.CylinderGeometry(0.06,0.09,0.55,10).translate(0,0.275,0), 0.37,0.25,0.14),
-  addColor(new THREE.ConeGeometry(0.46,0.6,18).translate(0,0.7,0), 0.17,0.43,0.19),
-  addColor(new THREE.ConeGeometry(0.34,0.55,18).translate(0,1.0,0), 0.20,0.47,0.21),
-  addColor(new THREE.ConeGeometry(0.22,0.5,18).translate(0,1.3,0), 0.24,0.52,0.24),
-], false);
-treeGeo.computeVertexNormals();
+// parametric low-poly tree: scale cone radial+height segments to ~targetTris triangles
+function buildTree(targetTris) {
+  const R = Math.min(256, Math.max(3, Math.round(Math.sqrt(Math.max(24, targetTris)) * 1.6)));
+  const H = Math.min(10, Math.max(1, Math.round(targetTris / (R * 9))));
+  const g = mergeGeometries([
+    addColor(new THREE.CylinderGeometry(0.06,0.09,0.55, Math.max(6, R>>1)).translate(0,0.275,0), 0.37,0.25,0.14),
+    addColor(new THREE.ConeGeometry(0.46,0.6, R, H).translate(0,0.7,0), 0.17,0.43,0.19),
+    addColor(new THREE.ConeGeometry(0.34,0.55, R, H).translate(0,1.0,0), 0.20,0.47,0.21),
+    addColor(new THREE.ConeGeometry(0.22,0.5, R, H).translate(0,1.3,0), 0.24,0.52,0.24),
+  ], false);
+  g.computeVertexNormals();
+  return g;
+}
+const treeTriangles = (g) => (g.index ? g.index.count : g.attributes.position.count) / 3;
+let treeGeo = buildTree(500), treeTris = treeTriangles(treeGeo);
 const bldgGeo = new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
 
 const treeMat = new THREE.MeshLambertNodeMaterial({ vertexColors: true });
@@ -216,23 +232,34 @@ for (const m of [trees, bldgs]) { m.castShadow = true; m.receiveShadow = true; m
 const treePos = new THREE.StorageBufferAttribute(TREES, 4), treeVis = new THREE.StorageBufferAttribute(TREES, 1);
 const bldgPos = new THREE.StorageBufferAttribute(BLDGS, 4), bldgVis = new THREE.StorageBufferAttribute(BLDGS, 1);
 
+// grid-aligned placement (matches the city demo): trees on countryside grass, buildings downtown
+const CW = WORLD / NT, tileWX = (i) => -HALF + (i + 0.5) * CW, propScale = Math.max(0.6, CW);
 const dummy = new THREE.Object3D();
 let seed = 1; const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
-for (let i = 0; i < TREES; i++) {
-  const x = (rnd()*2-1)*HALF, z = (rnd()*2-1)*HALF;
-  dummy.position.set(x, 0, z); dummy.rotation.set(0, rnd()*6.283, 0);
-  const s = 1.4 + rnd()*1.1; dummy.scale.set(s, s, s);
-  dummy.updateMatrix(); trees.setMatrixAt(i, dummy.matrix);
-  treePos.array.set([x, 1.5*s, z, 3.0*s], i*4); treeVis.array[i] = 1;
+let nTree = 0, nBldg = 0;
+const cxg = NT / 2, czg = NT / 2, town = Math.round(NT * 0.16);
+for (let z = 0; z < NT; z++) for (let x = 0; x < NT; x++) {
+  const tile = z * NT + x;
+  if (stateData[tile] >= ROAD0) continue;                  // skip roads + water
+  const wx = tileWX(x), wz = tileWX(z);
+  if (Math.abs(x - cxg) < town && Math.abs(z - czg) < town) {     // downtown -> buildings
+    if (rnd() < 0.6 && nBldg < BLDGS) {
+      stateData[tile] = ROCK0 + (rnd() * 6 | 0);
+      const i = nBldg++, h = rnd(), hy = propScale * (1.0 + h*h*h*7.0), ft = propScale * 0.9;
+      dummy.position.set(wx, 0, wz); dummy.rotation.set(0, (Math.floor(rnd()*4)) * 1.5708, 0);
+      dummy.scale.set(ft, hy, ft); dummy.updateMatrix(); bldgs.setMatrixAt(i, dummy.matrix);
+      bldgPos.array.set([wx, hy * 0.5, wz, hy * 0.6 + 3], i * 4); bldgVis.array[i] = 1;
+    }
+  } else if (rnd() < 0.10 && nTree < TREES) {                     // countryside -> ~10% trees
+    const i = nTree++, s = propScale * (1.1 + rnd() * 0.7);
+    dummy.position.set(wx, 0, wz); dummy.rotation.set(0, rnd() * 6.283, 0);
+    dummy.scale.set(s, s, s); dummy.updateMatrix(); trees.setMatrixAt(i, dummy.matrix);
+    treePos.array.set([wx, 1.5 * s, wz, 3.0 * s], i * 4); treeVis.array[i] = 1;
+  }
 }
-for (let i = 0; i < BLDGS; i++) {
-  const x = (rnd()*2-1)*HALF, z = (rnd()*2-1)*HALF;
-  dummy.position.set(x, 0, z); dummy.rotation.set(0, (Math.floor(rnd()*4))*1.5708, 0);
-  const h = rnd(), hy = 2 + h*h*12; dummy.scale.set(1.0+rnd()*0.6, hy, 1.0+rnd()*0.6);
-  dummy.updateMatrix(); bldgs.setMatrixAt(i, dummy.matrix);
-  bldgPos.array.set([x, hy*0.5, z, hy*0.6 + 3], i*4); bldgVis.array[i] = 1;
-}
+trees.count = nTree; bldgs.count = nBldg;
 trees.instanceMatrix.needsUpdate = true; bldgs.instanceMatrix.needsUpdate = true;
+stateTex.needsUpdate = true;                                // downtown tiles turned to concrete
 scene.add(trees, bldgs);
 
 // ── GPU compute frustum cull (WebGPU backend only — WebGL2 has no compute/storage) ──────────
@@ -268,7 +295,20 @@ if (isWebGPU) {
 const beEl = document.getElementById('be');
 beEl.textContent = isWebGPU ? 'WebGPU' : 'WebGL2 (fallback)';
 beEl.className = 'v ' + (isWebGPU ? 'gpu' : 'gl');
-document.getElementById('inst').textContent = (TREES + BLDGS).toLocaleString();
+document.getElementById('inst').textContent = (nTree + nBldg).toLocaleString();
+
+// tree polygon-count control: rebuild the tree model + hot-swap it onto the InstancedMesh
+const elPoly = document.getElementById('poly'), elPolyTot = document.getElementById('polyTot');
+function refreshPolyHud() { elPoly.textContent = treeTris.toLocaleString(); elPolyTot.textContent = (treeTris * nTree).toLocaleString(); }
+function setTreePolys(target) {
+  target = Math.max(24, Math.min(60000, target | 0));
+  const ng = buildTree(target); const old = trees.geometry; trees.geometry = ng; old.dispose();
+  treeGeo = ng; treeTris = treeTriangles(ng); refreshPolyHud();
+}
+refreshPolyHud();
+const polyInput = document.getElementById('polyInput');
+document.getElementById('polyBtn').onclick = () => setTreePolys(+polyInput.value);
+polyInput.onkeydown = (e) => { if (e.key === 'Enter') setTreePolys(+polyInput.value); };
 document.getElementById('toWebGPU').classList.toggle('active', isWebGPU);
 document.getElementById('toWebGL').classList.toggle('active', !isWebGPU);
 document.getElementById('toWebGPU').onclick = () => { location.search = ''; };
@@ -307,7 +347,7 @@ async function readVisible() {
   try {
     const tb = new Float32Array(await renderer.getArrayBufferAsync(treeVis));
     const bb = new Float32Array(await renderer.getArrayBufferAsync(bldgVis));
-    let c = 0; for (let i = 0; i < tb.length; i++) c += tb[i]; for (let i = 0; i < bb.length; i++) c += bb[i];
+    let c = 0; for (let i = 0; i < nTree; i++) c += tb[i]; for (let i = 0; i < nBldg; i++) c += bb[i];
     visCount = c | 0;
   } catch (e) { visCount = -2; } finally { readPending = false; }
 }
@@ -340,8 +380,8 @@ function animate() {
     elFps.textContent = fpsSmooth.toFixed(0);
     elMs.textContent = (gpuMs ? gpuMs : 1000/fpsSmooth).toFixed(2);
     elCalls.textContent = renderer.info.render.drawCalls;
-    elDrawn.textContent = !isWebGPU ? (TREES + BLDGS).toLocaleString()
-      : !cullOn ? (TREES + BLDGS).toLocaleString() + ' (all)'
+    elDrawn.textContent = !isWebGPU ? (nTree + nBldg).toLocaleString()
+      : !cullOn ? (nTree + nBldg).toLocaleString() + ' (all)'
       : visCount >= 0 ? visCount.toLocaleString() : '…';
   }
 }
