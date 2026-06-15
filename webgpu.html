@@ -29,6 +29,7 @@
   }
   .btns button:hover, .btns a:hover { background:rgba(255,255,255,0.15); }
   .btns button.active { background:var(--ok); color:#06250f; border-color:var(--ok); }
+  .btns button.on { background:var(--warn); color:#3a2400; border-color:var(--warn); }
   .hint { font-size:10.5px; color:var(--dim); margin-top:10px; line-height:15px; }
   #err { position:fixed; inset:0; display:none; align-items:center; justify-content:center; padding:40px;
     color:#ffd9d2; background:#1a0f12; font-size:13px; line-height:1.6; white-space:pre-wrap; z-index:50; }
@@ -71,6 +72,33 @@
     <div class="btns">
       <button id="cullBtn">GPU cull: on</button>
     </div>
+    <div class="grp-label">BUILD</div>
+    <div class="btns" id="tools">
+      <button data-tool="tree" class="active">Tree</button>
+      <button data-tool="bldg">Bldg</button>
+      <button data-tool="road">Road</button>
+      <button data-tool="grass">Grass</button>
+      <button data-tool="water">Water</button>
+      <button data-tool="clear">Clear</button>
+    </div>
+    <div class="btns" id="brushes">
+      <button data-brush="1" class="active">1×1</button>
+      <button data-brush="4">4×4</button>
+      <button data-brush="16">16×16</button>
+    </div>
+    <div class="grp-label">GRID</div>
+    <div class="btns" id="scales">
+      <button data-n="64">64</button>
+      <button data-n="128">128</button>
+      <button data-n="256" class="active">256</button>
+      <button data-n="512">512</button>
+    </div>
+    <div class="grp-label">SHADOWS / SUN / STRESS</div>
+    <div class="btns">
+      <button id="shadowBtn" class="active">shadows</button>
+      <button id="sunBtn">sun: static</button>
+      <button id="stressBtn">stress 5%</button>
+    </div>
     <div class="grp-label">LINKS</div>
     <div class="btns">
       <a href="index.html">‹ WebGL2 city demo</a>
@@ -87,7 +115,8 @@ import { Fn, instanceIndex, storage, uniform, float, positionLocal, If, texture,
 
 const WORLD = 200, HALF = WORLD / 2;
 const TREES = 60000, BLDGS = 12000;
-const LAYERS = 32, TILE = 64, NT = 256;   // terrain: 32-texture atlas, 256x256 tile grid
+const LAYERS = 32, TILE = 64;             // terrain: 32-texture atlas
+const NT = [64, 128, 256, 512].includes(+new URLSearchParams(location.search).get('n')) ? +new URLSearchParams(location.search).get('n') : 256;
 const GRASS0 = 0, GRASS_N = 12, SAND0 = 12, ROCK0 = 18, ROAD0 = 24, WATER0 = 30;
 
 // 32 procedural tile textures -> a DataArrayTexture (sampler2DArray), same as the WebGL2 demo
@@ -232,34 +261,63 @@ for (const m of [trees, bldgs]) { m.castShadow = true; m.receiveShadow = true; m
 const treePos = new THREE.StorageBufferAttribute(TREES, 4), treeVis = new THREE.StorageBufferAttribute(TREES, 1);
 const bldgPos = new THREE.StorageBufferAttribute(BLDGS, 4), bldgVis = new THREE.StorageBufferAttribute(BLDGS, 1);
 
-// grid-aligned placement (matches the city demo): trees on countryside grass, buildings downtown
+// ── editable prop pools (port of the city demo, with compute-cull pos/vis buffer sync) ──
 const CW = WORLD / NT, tileWX = (i) => -HALF + (i + 0.5) * CW, propScale = Math.max(0.6, CW);
 const dummy = new THREE.Object3D();
-let seed = 1; const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
 let nTree = 0, nBldg = 0;
-const cxg = NT / 2, czg = NT / 2, town = Math.round(NT * 0.16);
-for (let z = 0; z < NT; z++) for (let x = 0; x < NT; x++) {
-  const tile = z * NT + x;
-  if (stateData[tile] >= ROAD0) continue;                  // skip roads + water
-  const wx = tileWX(x), wz = tileWX(z);
-  if (Math.abs(x - cxg) < town && Math.abs(z - czg) < town) {     // downtown -> buildings
-    if (rnd() < 0.6 && nBldg < BLDGS) {
-      stateData[tile] = ROCK0 + (rnd() * 6 | 0);
-      const i = nBldg++, h = rnd(), hy = propScale * (1.0 + h*h*h*7.0), ft = propScale * 0.9;
-      dummy.position.set(wx, 0, wz); dummy.rotation.set(0, (Math.floor(rnd()*4)) * 1.5708, 0);
-      dummy.scale.set(ft, hy, ft); dummy.updateMatrix(); bldgs.setMatrixAt(i, dummy.matrix);
-      bldgPos.array.set([wx, hy * 0.5, wz, hy * 0.6 + 3], i * 4); bldgVis.array[i] = 1;
+const propAt = new Map(), treeTileOf = new Int32Array(TREES), bldgTileOf = new Int32Array(BLDGS);
+function placeTree(idx, tile, x, z, v) {
+  const s = propScale * (1.1 + v * 0.7);
+  dummy.position.set(x, 0, z); dummy.rotation.set(0, v * 6.283, 0); dummy.scale.set(s, s, s); dummy.updateMatrix();
+  trees.setMatrixAt(idx, dummy.matrix);
+  treePos.array.set([x, 1.5*s, z, 3.0*s], idx*4); treeVis.array[idx] = 1; treeTileOf[idx] = tile;
+}
+function placeBldg(idx, tile, x, z, v) {
+  const hy = propScale * (1.0 + v*v*v*7.0), ft = propScale * 0.9;
+  dummy.position.set(x, 0, z); dummy.rotation.set(0, (Math.floor(v*4)) * 1.5708, 0); dummy.scale.set(ft, hy, ft); dummy.updateMatrix();
+  bldgs.setMatrixAt(idx, dummy.matrix);
+  bldgPos.array.set([x, hy*0.5, z, hy*0.6 + 3], idx*4); bldgVis.array[idx] = 1; bldgTileOf[idx] = tile;
+}
+function addProp(tile, type, x, z, v) {
+  removeProp(tile);
+  if (type === 1 && nTree < TREES) { const i = nTree++; placeTree(i, tile, x, z, v); propAt.set(tile, { layer: 0, idx: i }); trees.count = nTree; }
+  else if (type === 2 && nBldg < BLDGS) { const i = nBldg++; placeBldg(i, tile, x, z, v); propAt.set(tile, { layer: 1, idx: i }); bldgs.count = nBldg; }
+}
+function removeProp(tile) {
+  const e = propAt.get(tile); if (!e) return;
+  if (e.layer === 0) {
+    const last = --nTree;
+    if (e.idx !== last) {
+      trees.getMatrixAt(last, dummy.matrix); trees.setMatrixAt(e.idx, dummy.matrix);
+      treePos.array.copyWithin(e.idx*4, last*4, last*4+4); treeVis.array[e.idx] = treeVis.array[last];
+      const mt = treeTileOf[last]; treeTileOf[e.idx] = mt; propAt.get(mt).idx = e.idx;
     }
-  } else if (rnd() < 0.10 && nTree < TREES) {                     // countryside -> ~10% trees
-    const i = nTree++, s = propScale * (1.1 + rnd() * 0.7);
-    dummy.position.set(wx, 0, wz); dummy.rotation.set(0, rnd() * 6.283, 0);
-    dummy.scale.set(s, s, s); dummy.updateMatrix(); trees.setMatrixAt(i, dummy.matrix);
-    treePos.array.set([wx, 1.5 * s, wz, 3.0 * s], i * 4); treeVis.array[i] = 1;
+    trees.count = nTree;
+  } else {
+    const last = --nBldg;
+    if (e.idx !== last) {
+      bldgs.getMatrixAt(last, dummy.matrix); bldgs.setMatrixAt(e.idx, dummy.matrix);
+      bldgPos.array.copyWithin(e.idx*4, last*4, last*4+4); bldgVis.array[e.idx] = bldgVis.array[last];
+      const mt = bldgTileOf[last]; bldgTileOf[e.idx] = mt; propAt.get(mt).idx = e.idx;
+    }
+    bldgs.count = nBldg;
+  }
+  propAt.delete(tile);
+}
+{ // initial city fill
+  let seed = 1; const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  const cxg = NT/2, czg = NT/2, town = Math.round(NT*0.16);
+  for (let z = 0; z < NT; z++) for (let x = 0; x < NT; x++) {
+    const tile = z*NT + x;
+    if (stateData[tile] >= ROAD0) continue;
+    const wx = tileWX(x), wz = tileWX(z);
+    if (Math.abs(x-cxg) < town && Math.abs(z-czg) < town) {
+      if (rnd() < 0.6) { stateData[tile] = ROCK0 + (rnd()*6|0); addProp(tile, 2, wx, wz, rnd()); }
+    } else if (rnd() < 0.10) { addProp(tile, 1, wx, wz, rnd()); }
   }
 }
-trees.count = nTree; bldgs.count = nBldg;
 trees.instanceMatrix.needsUpdate = true; bldgs.instanceMatrix.needsUpdate = true;
-stateTex.needsUpdate = true;                                // downtown tiles turned to concrete
+stateTex.needsUpdate = true;
 scene.add(trees, bldgs);
 
 // ── GPU compute frustum cull (WebGPU backend only — WebGL2 has no compute/storage) ──────────
@@ -330,6 +388,61 @@ if (isWebGPU) {
   cullBtn.textContent = 'GPU cull — WebGPU only'; elCullV.textContent = 'n/a (no compute)';
 }
 
+// ── editing: pick (ray/plane) + paint tools + brushes ──
+const raycaster = new THREE.Raycaster(), gplane = new THREE.Plane(new THREE.Vector3(0,1,0), 0), hit = new THREE.Vector3(), ndc = new THREE.Vector2();
+function tileAt(cx, cy) {
+  ndc.set((cx/innerWidth)*2-1, -(cy/innerHeight)*2+1); raycaster.setFromCamera(ndc, camera);
+  if (!raycaster.ray.intersectPlane(gplane, hit)) return null;
+  const tx = Math.floor((hit.x+HALF)/WORLD*NT), tz = Math.floor((hit.z+HALF)/WORLD*NT);
+  return (tx<0||tz<0||tx>=NT||tz>=NT) ? null : { tx, tz };
+}
+let currentTool = 'tree', brush = 1;
+function applyTool(tx, tz) {
+  const tile = tz*NT+tx, x = tileWX(tx), z = tileWX(tz);
+  switch (currentTool) {
+    case 'tree':  stateData[tile] = GRASS0 + (Math.random()*GRASS_N|0); addProp(tile, 1, x, z, Math.random()); break;
+    case 'bldg':  stateData[tile] = ROCK0 + (Math.random()*6|0);        addProp(tile, 2, x, z, Math.random()); break;
+    case 'road':  stateData[tile] = ROAD0 + (Math.random()*4|0);        removeProp(tile); break;
+    case 'grass': stateData[tile] = GRASS0 + (Math.random()*GRASS_N|0); removeProp(tile); break;
+    case 'water': stateData[tile] = WATER0 + (Math.random()<0.5?0:1);   removeProp(tile); break;
+    case 'clear': removeProp(tile); break;
+  }
+}
+function paint(txc, tzc) {
+  const x0 = Math.max(0, txc-(brush>>1)), z0 = Math.max(0, tzc-(brush>>1)), x1 = Math.min(NT, x0+brush), z1 = Math.min(NT, z0+brush);
+  for (let z = z0; z < z1; z++) for (let x = x0; x < x1; x++) applyTool(x, z);
+  stateTex.needsUpdate = true;
+  trees.instanceMatrix.needsUpdate = true; bldgs.instanceMatrix.needsUpdate = true;
+  treePos.needsUpdate = true; treeVis.needsUpdate = true; bldgPos.needsUpdate = true; bldgVis.needsUpdate = true;
+  document.getElementById('inst').textContent = (nTree+nBldg).toLocaleString(); refreshPolyHud();
+}
+let downX = 0, downY = 0, moved = false;
+const dom = renderer.domElement;
+dom.addEventListener('pointerdown', (e) => { if (e.button === 0) { downX = e.clientX; downY = e.clientY; moved = false; } });
+dom.addEventListener('pointermove', (e) => { if (Math.abs(e.clientX-downX) > 5 || Math.abs(e.clientY-downY) > 5) moved = true; });
+dom.addEventListener('pointerup', (e) => { if (e.button !== 0 || moved) return; const t = tileAt(e.clientX, e.clientY); if (t) paint(t.tx, t.tz); });
+document.querySelectorAll('#tools button').forEach((b) => b.onclick = () => { currentTool = b.dataset.tool; document.querySelectorAll('#tools button').forEach((x) => x.classList.toggle('active', x === b)); });
+document.querySelectorAll('#brushes button').forEach((b) => b.onclick = () => { brush = +b.dataset.brush; document.querySelectorAll('#brushes button').forEach((x) => x.classList.toggle('active', x === b)); });
+document.querySelectorAll('#scales button').forEach((b) => {
+  b.classList.toggle('active', +b.dataset.n === NT);
+  b.onclick = () => { const p = new URLSearchParams(location.search); p.set('n', b.dataset.n); location.search = p.toString(); };
+});
+
+// ── shadows toggle · moving sun · stress ──
+let shadows = true;
+const shadowBtn = document.getElementById('shadowBtn');
+function setShadows(on) { shadows = on; renderer.shadowMap.enabled = on; for (const m of [terrainMat, treeMat, bldgMat]) m.needsUpdate = true; shadowBtn.classList.toggle('active', on); shadowBtn.textContent = on ? 'shadows' : 'no shadows'; }
+shadowBtn.onclick = () => setShadows(!shadows);
+let sunMoving = false, sunAngle = Math.atan2(0.32, 0.5);
+const SUN_R = Math.hypot(0.5, 0.32) * WORLD, SUN_H = WORLD * 0.42;
+const sunBtn = document.getElementById('sunBtn');
+function setSun(on) { sunMoving = on; sunBtn.classList.toggle('on', on); sunBtn.textContent = on ? 'sun: moving' : 'sun: static'; }
+sunBtn.onclick = () => setSun(!sunMoving);
+let stress = false;
+const stressBtn = document.getElementById('stressBtn');
+stressBtn.onclick = () => { stress = !stress; stressBtn.classList.toggle('on', stress); };
+function stressStep() { const k = (NT*NT*0.05)|0; for (let j = 0; j < k; j++) { const t = (Math.random()*NT*NT)|0; stateData[t] = (Math.random()*LAYERS)|0; } stateTex.needsUpdate = true; }
+
 window.addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
@@ -354,6 +467,8 @@ async function readVisible() {
 
 function animate() {
   const now = performance.now(), dt = now - prev; prev = now;
+  if (stress) stressStep();
+  if (sunMoving) { sunAngle += dt * 0.0004; sun.position.set(Math.cos(sunAngle)*SUN_R, SUN_H, Math.sin(sunAngle)*SUN_R); }
   controls.update();
   if (treeCull && cullOn) {                 // run the GPU frustum-cull compute pass before the render
     updateFrustum();
