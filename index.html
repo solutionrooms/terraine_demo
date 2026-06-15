@@ -78,6 +78,7 @@
   <div id="hud">
     <div class="title">GPU CITY · FLAT GRID + 3D PROPS</div>
     <div class="row"><span class="k">Draw calls</span><span id="hud-calls" class="v">–</span></div>
+    <div class="row"><span class="k" id="hud-ms-k">GPU ms</span><span id="hud-ms" class="v">–</span></div>
     <div class="row"><span class="k">FPS</span><span id="hud-fps" class="v">–</span></div>
     <canvas id="spark" width="196" height="32"></canvas>
     <div class="row"><span class="k">Grid</span><span id="hud-grid" class="v">–</span></div>
@@ -598,6 +599,14 @@ function drawSpark() {
   sctx.stroke();
 }
 
+// real GPU time per frame via a timer query (decoupled from the vsync-capped frame interval)
+const elMs = document.getElementById('hud-ms');
+const glx = renderer.getContext();
+const timerExt = glx.getExtension('EXT_disjoint_timer_query_webgl2');
+const gpuQuery = timerExt ? glx.createQuery() : null;
+let queryActive = false, gpuMs = 0;
+document.getElementById('hud-ms-k').textContent = timerExt ? 'GPU ms' : 'Frame ms';
+
 let prev = performance.now(), fpsSmooth = 0, hudAccum = 0, secAccum = 0, edps = 0;
 function frame(now) {
   requestAnimationFrame(frame);
@@ -609,7 +618,19 @@ function frame(now) {
     renderer.shadowMap.needsUpdate = true;           // re-render the shadow map this frame
   }
   controls.update();
+
+  // collect the previous frame's GPU timing, then time this render
+  if (timerExt && queryActive) {
+    if (glx.getQueryParameter(gpuQuery, glx.QUERY_RESULT_AVAILABLE) && !glx.getParameter(timerExt.GPU_DISJOINT_EXT)) {
+      const ms = glx.getQueryParameter(gpuQuery, glx.QUERY_RESULT) / 1e6;
+      gpuMs = gpuMs ? gpuMs * 0.85 + ms * 0.15 : ms;
+      queryActive = false;
+    }
+  }
+  const startQuery = timerExt && !queryActive;
+  if (startQuery) glx.beginQuery(timerExt.TIME_ELAPSED_EXT, gpuQuery);
   renderer.render(scene, camera);
+  if (startQuery) { glx.endQuery(timerExt.TIME_ELAPSED_EXT); queryActive = true; }
 
   const calls = renderer.info.render.calls;
   ftHist[ftIdx] = dt; ftIdx = (ftIdx + 1) % spark.width; drawSpark();
@@ -622,6 +643,7 @@ function frame(now) {
     elCalls.textContent = calls;
     elCalls.className = 'v ' + (calls < 100 ? 'ok' : 'warn');
     elFps.textContent = fpsSmooth.toFixed(0);
+    elMs.textContent = (timerExt ? gpuMs : 1000 / fpsSmooth).toFixed(2);
     elProps.textContent = treeCount.toLocaleString() + ' / ' + bldgCount.toLocaleString();
     elEdits.textContent = edps.toLocaleString();
   }
