@@ -39,6 +39,30 @@
     position:fixed; inset:0; z-index:20; display:flex; align-items:center; justify-content:center;
     background:rgba(8,12,18,0.6); color:#fff; font-size:14px; letter-spacing:1px; pointer-events:none;
   }
+  #techBtn { width:100%; }
+
+  /* technical explainer panel */
+  #techPanel {
+    position:fixed; top:14px; right:14px; bottom:14px; z-index:30; width:min(460px, 42vw);
+    display:none; flex-direction:column;
+    background:rgba(12,17,25,0.94); border:1px solid rgba(255,255,255,0.12); border-radius:10px;
+    box-shadow:0 10px 40px rgba(0,0,0,0.55); backdrop-filter:blur(8px); pointer-events:auto;
+  }
+  #techPanel.open { display:flex; }
+  #techHead { display:flex; align-items:center; justify-content:space-between;
+    padding:14px 16px; border-bottom:1px solid rgba(255,255,255,0.10); }
+  #techHead h2 { margin:0; font-size:12px; letter-spacing:1.5px; color:var(--ok); }
+  #techClose { background:none; border:0; color:var(--dim); font-size:20px; line-height:1; cursor:pointer; padding:0 4px; }
+  #techClose:hover { color:#fff; }
+  #techBody { overflow-y:auto; padding:6px 18px 18px; color:#d6deea; }
+  #techBody h3 { font-size:12px; letter-spacing:0.6px; color:#fff; margin:18px 0 6px; }
+  #techBody h3 .n { color:var(--ok); margin-right:6px; }
+  #techBody p, #techBody li { font-size:12.5px; line-height:1.62; color:#c2ccdb; }
+  #techBody ul { margin:6px 0; padding-left:18px; }
+  #techBody li { margin:3px 0; }
+  #techBody code { color:#9ec5ff; background:rgba(255,255,255,0.06); padding:0 4px; border-radius:3px; font-size:11.5px; }
+  #techBody .lead { color:#aeb9c9; border-left:2px solid var(--ok); padding-left:10px; margin-top:10px; }
+  #techBody b { color:#eaf0f8; }
 </style>
 
 <script type="importmap">
@@ -94,7 +118,49 @@
     <div class="btns">
       <button id="stressBtn">randomize 5% of tiles / frame</button>
     </div>
+    <div class="grp-label">ABOUT</div>
+    <div class="btns">
+      <button id="techBtn">▸ technology — how it works</button>
+    </div>
     <div class="hint">pick a tool + size, click to paint · drag: rotate<br>arrows: pan · Z/X: zoom · 1–5: grid · H: shadows · U: sun · S: stress</div>
+  </div>
+
+  <div id="techPanel">
+    <div id="techHead"><h2>TECHNOLOGY — THE PROCESSING MODEL</h2><button id="techClose" title="close">×</button></div>
+    <div id="techBody">
+      <p class="lead">The whole world lives as <b>data on the GPU</b>, not as CPU-side objects. The renderer is data-driven: a handful of draw calls whose cost is decoupled from the number of tiles. This is what lets the same code run a 64&times;64 grid and a 4096&times;4096 (16.8M-tile) grid at a similar frame rate.</p>
+
+      <h3><span class="n">1</span>Terrain — one quad, indexed by a texture</h3>
+      <p>The ground is a <b>single 2-triangle quad</b> spanning the world, drawn <b>once</b>. There is no geometry per tile. Each tile's identity is a single byte in an N&times;N single-channel (<code>R8</code>) "state texture" — the index (0&ndash;31) of that tile's material.</p>
+      <p>For every screen pixel that lands on the ground, the fragment shader derives which tile it falls in from the world-space position, reads that tile's byte from the state texture (nearest-filtered), and samples the matching layer of a <b>32-layer texture array</b> for the final colour. So the terrain's cost is <b>per visible pixel, not per tile</b>: raising the grid from 256&sup2; to 4096&sup2; only grows a texture's resolution, never the geometry or the draw count.</p>
+
+      <h3><span class="n">2</span>No CPU-side tiles &rarr; no garbage</h3>
+      <p>There is not a single JavaScript object per tile. The grid is just the typed array backing the state texture. Editing a tile writes <b>one byte</b> and uploads <b>one texel</b> to the GPU (a 1&times;1 sub-image) &mdash; O(1), no scene rebuild, no allocation. The steady-state render loop allocates nothing, so there is no garbage-collection churn. (This was the core constraint: per-object JS allocation, not the GPU, is what kills this kind of grid.)</p>
+
+      <h3><span class="n">3</span>Trees &amp; buildings — hardware instancing</h3>
+      <p>Props are drawn with <b>GPU instancing</b>: one tree mesh (~500 triangles) and one box are each submitted a single time, and the GPU stamps out thousands of copies, every copy reading its own 4&times;4 transform from an instance buffer held in GPU memory. <b>One draw call per prop type</b>, regardless of how many there are.</p>
+      <ul>
+        <li>Per-instance data lives on the GPU: position, a per-tile pseudo-random rotation/scale, building height baked into the matrix's vertical scale, and a per-instance colour tint.</li>
+        <li>Placing a prop writes one matrix using a single <b>reused</b> CPU object (zero per-edit allocation). Removing one does a <b>swap-remove</b> — the last instance fills the gap and the active count shrinks — keeping the buffer dense.</li>
+        <li>A fixed instance budget makes prop cost independent of grid size.</li>
+      </ul>
+
+      <h3><span class="n">4</span>Lighting &amp; shadows</h3>
+      <p>Shading is a single directional light (the sun) plus a hemisphere (sky/ground) ambient term, evaluated per fragment. Shadows use a <b>shadow map</b>: before the main image, the shadow-casters are rendered from the sun's viewpoint into an off-screen depth texture; during the main pass each lit fragment re-projects into that depth texture and compares depths (percentage-closer filtering over several taps) to decide if it is occluded.</p>
+      <p>Because the sun and the geometry don't change while you orbit, a directional shadow map is <b>camera-independent</b>: it is rendered <b>once and reused every frame</b> (the costly per-frame shadow render is skipped), and only refreshed when you edit. The <b>moving-sun</b> mode instead re-renders it every frame &mdash; that is the cost it adds. Notably, the dominant per-frame cost is the shadow-map <b>sampling</b> (fragment work), not geometry: it is roughly constant whether there are 3,000 or 250,000 props, which is why turning shadows off can roughly double the frame rate.</p>
+
+      <h3><span class="n">5</span>Picking — analytic, not raycast</h3>
+      <p>Clicking does not test the cursor against any geometry. The camera ray is intersected <b>mathematically with the ground plane</b> (y&nbsp;=&nbsp;0) and the hit point is floored into tile coordinates. O(1), exact at any zoom or angle, independent of tile count.</p>
+
+      <h3><span class="n">6</span>The frame &amp; the draw-call budget</h3>
+      <p>Each frame issues <b>3 draw calls</b> for the visible scene &mdash; terrain, trees, buildings &mdash; plus one shadow depth pass when shadows are on. That number is <b>constant</b>: it does not grow with tiles or props. The "stress test" (re-randomising 5% of tiles every frame) is just a bulk byte-write plus one texture upload, which is why mass real-time editing stays cheap.</p>
+
+      <h3><span class="n">7</span>Why no frustum-culling chunks</h3>
+      <p>Splitting props into many small meshes so off-screen ones could be culled was tried and <b>reverted</b>: at these instance counts the extra draw-call and shader-state overhead (dozens of draws versus 3) cost more than the culling saved. Letting the GPU chew through all instances in one big instanced draw is faster here; spatial culling only pays off at far larger geometry counts.</p>
+
+      <h3><span class="n">8</span>Why the approach scales</h3>
+      <p>The design deliberately keeps the two costs that <i>could</i> grow with the world bounded: terrain is a fixed-cost textured quad (fragment-bound, screen-resolution only), and props are a fixed instance budget. Nothing in the steady-state path is O(tiles). The grid resolution only changes texture sizes and one-time fill work &mdash; never the per-frame draw structure.</p>
+    </div>
   </div>
 
   <div id="loading">building world…</div>
@@ -479,6 +545,11 @@ function setSun(on) {
   if (!on) renderer.shadowMap.needsUpdate = true;   // settle the now-static shadow map once
 }
 sunBtn.addEventListener('click', () => setSun(!sunMoving));
+
+// technology explainer panel
+const techPanel = document.getElementById('techPanel');
+document.getElementById('techBtn').addEventListener('click', () => techPanel.classList.toggle('open'));
+document.getElementById('techClose').addEventListener('click', () => techPanel.classList.remove('open'));
 
 const loadingEl = document.getElementById('loading');
 function switchScale(n) {
