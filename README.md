@@ -11,11 +11,11 @@ A low-poly city renderer in a single self-contained `index.html` (Three.js r0.18
 
 There's also a separate **`webgpu.html`** (the "⇄ WebGPU version" button) — see below.
 
-## WebGPU build with GPU compute culling (`webgpu.html`)
+## WebGPU build (`webgpu.html`) — full city demo on either backend + GPU compute culling
 
-The same instanced scene (72k trees/buildings + shadows) on three.js's **`WebGPURenderer`** with node materials, so one codebase runs on **either backend** — a **RENDERER switch** flips WebGPU ⇄ WebGL2 (`forceWebGL`) for an apples-to-apples comparison.
+A complete TSL/`WebGPURenderer` port of the city demo, so **one codebase runs on either backend** — a **RENDERER switch** flips WebGPU ⇄ WebGL2 (`forceWebGL`) for an apples-to-apples comparison. It has the same features: the **32-texture terrain** (sampled as a node-material `colorNode`: state texture → atlas-array `.depth(layer)`), **editable** props (paint tools + brushes, ray/plane picking), **grid sizes** 64–512 (`?n=` URL param), **moving sun / shadows toggle / 5% stress**, and a **GPU-ms** readout (WebGPU timestamps). Plus a **tree poly-count** input that rebuilds the tree model to a target triangle count and hot-swaps it onto the instanced mesh — to compare the two backends under vertex load.
 
-On the WebGPU backend it adds **GPU-driven frustum culling** that's impossible in WebGL2: a **TSL compute shader** frustum-tests all 72k instances in parallel (reading a per-instance position/radius storage buffer and the camera's 6 frustum planes), writes a per-instance visibility flag, and the vertex stage degenerates the culled instances. A buffer readback shows the live **drawn (visible)** count. Verified: zoomed out ≈ 51k/72k pass; zoomed in ≈ 1.7k/72k — the compute pass culls ~98% off-screen. Toggle the cull and watch GPU ms. (WebGL2 backend = no compute, draws all instances.)
+On the **WebGPU backend only** it adds **GPU-driven frustum culling** (impossible in WebGL2 — no compute/storage): a **TSL compute shader** frustum-tests every instance in parallel (per-instance position/radius storage buffer + the camera's 6 frustum planes), writes a per-instance visibility flag, and the vertex stage degenerates the culled instances; a storage readback shows the live **drawn (visible)** count. Verified: ~98% of off-screen instances culled when zoomed in. The editable prop pool keeps the cull's storage buffers in sync on every paint. (WebGL2 backend = no compute, draws all instances.)
 
 ## Architecture
 
