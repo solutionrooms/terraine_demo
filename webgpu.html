@@ -52,16 +52,22 @@
     <div class="row"><span class="k">FPS</span><span id="fps" class="v">–</span></div>
     <div class="row"><span class="k">Draw calls</span><span id="calls" class="v">–</span></div>
     <div class="row"><span class="k">Instances</span><span id="inst" class="v">–</span></div>
+    <div class="row"><span class="k">Drawn (visible)</span><span id="drawn" class="v">–</span></div>
+    <div class="row"><span class="k">GPU cull</span><span id="cull" class="v">–</span></div>
     <div class="grp-label">RENDERER</div>
     <div class="btns">
       <button id="toWebGPU">WebGPU</button>
       <button id="toWebGL">WebGL2</button>
     </div>
+    <div class="grp-label">COMPUTE CULLING</div>
+    <div class="btns">
+      <button id="cullBtn">GPU cull: on</button>
+    </div>
     <div class="grp-label">LINKS</div>
     <div class="btns">
       <a href="index.html">‹ WebGL2 city demo</a>
     </div>
-    <div class="hint">drag: rotate · scroll: zoom<br>switch backend to compare the same scene</div>
+    <div class="hint">zoom in &amp; watch "drawn" fall as the GPU compute pass culls.<br>toggle cull, or switch backend, and compare GPU ms.</div>
   </div>
   <div id="err"></div>
 
@@ -69,6 +75,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { Fn, instanceIndex, storage, uniform, float, positionLocal, If } from 'three/tsl';
 
 const WORLD = 200, HALF = WORLD / 2;
 const TREES = 60000, BLDGS = 12000;
@@ -151,22 +158,58 @@ const bldgMat = new THREE.MeshLambertNodeMaterial({ color: 0x9a9c9f });
 const trees = new THREE.InstancedMesh(treeGeo, treeMat, TREES);
 const bldgs = new THREE.InstancedMesh(bldgGeo, bldgMat, BLDGS);
 for (const m of [trees, bldgs]) { m.castShadow = true; m.receiveShadow = true; m.frustumCulled = false; }
+
+// per-instance data the compute pass reads: vec4(centre.xyz, boundingRadius) + a visibility float
+const treePos = new THREE.StorageBufferAttribute(TREES, 4), treeVis = new THREE.StorageBufferAttribute(TREES, 1);
+const bldgPos = new THREE.StorageBufferAttribute(BLDGS, 4), bldgVis = new THREE.StorageBufferAttribute(BLDGS, 1);
+
 const dummy = new THREE.Object3D();
 let seed = 1; const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
 for (let i = 0; i < TREES; i++) {
-  dummy.position.set((rnd()*2-1)*HALF, 0, (rnd()*2-1)*HALF);
-  dummy.rotation.set(0, rnd()*6.283, 0);
+  const x = (rnd()*2-1)*HALF, z = (rnd()*2-1)*HALF;
+  dummy.position.set(x, 0, z); dummy.rotation.set(0, rnd()*6.283, 0);
   const s = 1.4 + rnd()*1.1; dummy.scale.set(s, s, s);
   dummy.updateMatrix(); trees.setMatrixAt(i, dummy.matrix);
+  treePos.array.set([x, 1.5*s, z, 3.0*s], i*4); treeVis.array[i] = 1;
 }
 for (let i = 0; i < BLDGS; i++) {
-  dummy.position.set((rnd()*2-1)*HALF, 0, (rnd()*2-1)*HALF);
-  dummy.rotation.set(0, (Math.floor(rnd()*4))*1.5708, 0);
-  const h = rnd(); dummy.scale.set(1.0+rnd()*0.6, 2 + h*h*12, 1.0+rnd()*0.6);
+  const x = (rnd()*2-1)*HALF, z = (rnd()*2-1)*HALF;
+  dummy.position.set(x, 0, z); dummy.rotation.set(0, (Math.floor(rnd()*4))*1.5708, 0);
+  const h = rnd(), hy = 2 + h*h*12; dummy.scale.set(1.0+rnd()*0.6, hy, 1.0+rnd()*0.6);
   dummy.updateMatrix(); bldgs.setMatrixAt(i, dummy.matrix);
+  bldgPos.array.set([x, hy*0.5, z, hy*0.6 + 3], i*4); bldgVis.array[i] = 1;
 }
 trees.instanceMatrix.needsUpdate = true; bldgs.instanceMatrix.needsUpdate = true;
 scene.add(trees, bldgs);
+
+// ── GPU compute frustum cull (WebGPU backend only — WebGL2 has no compute/storage) ──────────
+const planeU = []; for (let i = 0; i < 6; i++) planeU.push(uniform(new THREE.Vector4()));
+const uCull = uniform(1);                       // 1 = culling active, 0 = draw everything
+const _frustum = new THREE.Frustum(), _vpm = new THREE.Matrix4();
+let treeCull = null, bldgCull = null;
+function updateFrustum() {
+  camera.updateMatrixWorld();
+  camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+  _vpm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  _frustum.setFromProjectionMatrix(_vpm);
+  for (let i = 0; i < 6; i++) { const p = _frustum.planes[i]; planeU[i].value.set(p.normal.x, p.normal.y, p.normal.z, p.constant); }
+}
+if (isWebGPU) {
+  const treePosS = storage(treePos, 'vec4', TREES), treeVisS = storage(treeVis, 'float', TREES);
+  const bldgPosS = storage(bldgPos, 'vec4', BLDGS), bldgVisS = storage(bldgVis, 'float', BLDGS);
+  const kernel = (posS, visS) => Fn(() => {
+    const p = posS.element(instanceIndex);
+    const vis = float(1).toVar();
+    const test = (pl) => If(pl.xyz.dot(p.xyz).add(pl.w).lessThan(p.w.negate()), () => { vis.assign(0); });
+    test(planeU[0]); test(planeU[1]); test(planeU[2]); test(planeU[3]); test(planeU[4]); test(planeU[5]);
+    visS.element(instanceIndex).assign(vis);
+  });
+  treeCull = kernel(treePosS, treeVisS)().compute(TREES);
+  bldgCull = kernel(bldgPosS, bldgVisS)().compute(BLDGS);
+  // degenerate culled instances in the vertex stage; uCull gates the whole effect for A/B comparison
+  treeMat.positionNode = positionLocal.mul(treeVisS.element(instanceIndex).max(float(1).sub(uCull)));
+  bldgMat.positionNode = positionLocal.mul(bldgVisS.element(instanceIndex).max(float(1).sub(uCull)));
+}
 
 // HUD
 const beEl = document.getElementById('be');
@@ -178,17 +221,52 @@ document.getElementById('toWebGL').classList.toggle('active', !isWebGPU);
 document.getElementById('toWebGPU').onclick = () => { location.search = ''; };
 document.getElementById('toWebGL').onclick = () => { location.search = '?gl=1'; };
 
+let cullOn = true;
+const cullBtn = document.getElementById('cullBtn'), elCullV = document.getElementById('cull');
+if (isWebGPU) {
+  const setCull = (on) => {
+    cullOn = on; uCull.value = on ? 1 : 0;
+    cullBtn.classList.toggle('active', on);
+    cullBtn.textContent = on ? 'GPU cull: ON' : 'GPU cull: OFF';
+    elCullV.textContent = on ? 'on (frustum)' : 'off (drawing all)';
+  };
+  cullBtn.onclick = () => setCull(!cullOn);
+  setCull(true);
+} else {
+  cullOn = false; cullBtn.disabled = true; cullBtn.style.opacity = 0.5;
+  cullBtn.textContent = 'GPU cull — WebGPU only'; elCullV.textContent = 'n/a (no compute)';
+}
+
 window.addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
 });
 
-const elMs = document.getElementById('ms'), elFps = document.getElementById('fps'), elCalls = document.getElementById('calls');
+const elMs = document.getElementById('ms'), elFps = document.getElementById('fps'),
+      elCalls = document.getElementById('calls'), elDrawn = document.getElementById('drawn');
 let prev = performance.now(), fpsSmooth = 0, gpuMs = 0, acc = 0, resolvePending = false;
+
+// read the visibility buffers back to count how many instances survive culling (proof + metric)
+let visCount = -1, readPending = false, readAcc = 0;
+async function readVisible() {
+  if (readPending || !isWebGPU || typeof renderer.getArrayBufferAsync !== 'function') return;
+  readPending = true;
+  try {
+    const tb = new Float32Array(await renderer.getArrayBufferAsync(treeVis));
+    const bb = new Float32Array(await renderer.getArrayBufferAsync(bldgVis));
+    let c = 0; for (let i = 0; i < tb.length; i++) c += tb[i]; for (let i = 0; i < bb.length; i++) c += bb[i];
+    visCount = c | 0;
+  } catch (e) { visCount = -2; } finally { readPending = false; }
+}
 
 function animate() {
   const now = performance.now(), dt = now - prev; prev = now;
   controls.update();
+  if (treeCull && cullOn) {                 // run the GPU frustum-cull compute pass before the render
+    updateFrustum();
+    renderer.compute(treeCull);
+    renderer.compute(bldgCull);
+  }
   renderer.render(scene, camera);
 
   // GPU time via WebGPU timestamps — one resolve in flight at a time; ignore absurd values
@@ -201,12 +279,17 @@ function animate() {
     }).catch(() => { resolvePending = false; });
   }
   fpsSmooth = fpsSmooth ? fpsSmooth*0.9 + (1000/dt)*0.1 : 1000/dt;
+  readAcc += dt;
+  if (cullOn && readAcc >= 350) { readAcc = 0; readVisible(); }
   acc += dt;
   if (acc >= 200) {
     acc = 0;
     elFps.textContent = fpsSmooth.toFixed(0);
     elMs.textContent = (gpuMs ? gpuMs : 1000/fpsSmooth).toFixed(2);
     elCalls.textContent = renderer.info.render.drawCalls;
+    elDrawn.textContent = !isWebGPU ? (TREES + BLDGS).toLocaleString()
+      : !cullOn ? (TREES + BLDGS).toLocaleString() + ' (all)'
+      : visCount >= 0 ? visCount.toLocaleString() : '…';
   }
 }
 renderer.setAnimationLoop(animate);

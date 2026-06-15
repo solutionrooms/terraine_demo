@@ -7,6 +7,15 @@ A low-poly city renderer in a single self-contained `index.html` (Three.js r0.18
 - **Distant-sun `DirectionalLight` with cast shadows** (toggleable) + hemisphere ambient.
 - **Realtime editing** (paint tools + brushes) and a **stress test that randomizes 5% of tiles every frame**.
 - Renders in **3 draw calls** (terrain + trees + buildings), independent of grid size and prop count.
+- A **GPU ms** readout (GPU timer query) — the real render cost, decoupled from the vsync-capped FPS.
+
+There's also a separate **`webgpu.html`** (the "⇄ WebGPU version" button) — see below.
+
+## WebGPU build with GPU compute culling (`webgpu.html`)
+
+The same instanced scene (72k trees/buildings + shadows) on three.js's **`WebGPURenderer`** with node materials, so one codebase runs on **either backend** — a **RENDERER switch** flips WebGPU ⇄ WebGL2 (`forceWebGL`) for an apples-to-apples comparison.
+
+On the WebGPU backend it adds **GPU-driven frustum culling** that's impossible in WebGL2: a **TSL compute shader** frustum-tests all 72k instances in parallel (reading a per-instance position/radius storage buffer and the camera's 6 frustum planes), writes a per-instance visibility flag, and the vertex stage degenerates the culled instances. A buffer readback shows the live **drawn (visible)** count. Verified: zoomed out ≈ 51k/72k pass; zoomed in ≈ 1.7k/72k — the compute pass culls ~98% off-screen. Toggle the cull and watch GPU ms. (WebGL2 backend = no compute, draws all instances.)
 
 ## Architecture
 
