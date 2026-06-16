@@ -92,6 +92,8 @@
       <button data-n="128">128</button>
       <button data-n="256" class="active">256</button>
       <button data-n="512">512</button>
+      <button data-n="1024">1024</button>
+      <button data-n="2048">2048</button>
     </div>
     <div class="grp-label">SHADOWS / SUN / STRESS</div>
     <div class="btns">
@@ -114,9 +116,9 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { Fn, instanceIndex, storage, uniform, float, positionLocal, If, texture, positionWorld, vec3, normalLocal, atomicAdd, atomicStore, uint } from 'three/tsl';
 
 const WORLD = 200, HALF = WORLD / 2;
-const TREES = 60000, BLDGS = 12000;
+const TREES = 120000, BLDGS = 30000;
 const LAYERS = 32, TILE = 64;             // terrain: 32-texture atlas
-const NT = [64, 128, 256, 512].includes(+new URLSearchParams(location.search).get('n')) ? +new URLSearchParams(location.search).get('n') : 256;
+const NT = [64, 128, 256, 512, 1024, 2048].includes(+new URLSearchParams(location.search).get('n')) ? +new URLSearchParams(location.search).get('n') : 256;
 const GRASS0 = 0, GRASS_N = 12, SAND0 = 12, ROCK0 = 18, ROAD0 = 24, WATER0 = 30;
 
 // 32 procedural tile textures -> a DataArrayTexture (sampler2DArray), same as the WebGL2 demo
@@ -184,7 +186,22 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 0);
 controls.enableDamping = true; controls.dampingFactor = 0.08;
 controls.maxPolarAngle = Math.PI * 0.49; controls.minDistance = 14; controls.maxDistance = 900;
+controls.listenToKeyEvents(window);          // arrow keys pan
+controls.keyPanSpeed = 16;
 controls.update();
+
+// keyboard zoom (Z in / X out) — dolly along the view ray, reused scratch (no alloc)
+const _camOff = new THREE.Vector3();
+function zoomBy(f) {
+  _camOff.copy(camera.position).sub(controls.target);
+  _camOff.setLength(Math.min(controls.maxDistance, Math.max(controls.minDistance, _camOff.length() * f)));
+  camera.position.copy(controls.target).add(_camOff);
+  controls.update();
+}
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'z' || e.key === 'Z') zoomBy(0.9);
+  else if (e.key === 'x' || e.key === 'X') zoomBy(1.1);
+});
 
 const sun = new THREE.DirectionalLight(0xfff1d8, 2.7);
 sun.position.set(WORLD * 0.5, WORLD * 0.42, WORLD * 0.32);
@@ -253,21 +270,29 @@ const bldgGeo = new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
 const treeMat = new THREE.MeshLambertNodeMaterial({ vertexColors: true });
 const bldgMat = new THREE.MeshLambertNodeMaterial({ color: 0x9a9c9f });
 const uTreeCount = uniform(0);
+const uBldgCount = uniform(0);
 
 // TREES — GPU-driven indirect draw: bounding sphere + source transform + compacted-visible set + draw args
 const treePos      = new THREE.StorageBufferAttribute(TREES, 4);   // (cx,cy,cz,radius) for the frustum test
 const treeXform    = new THREE.StorageBufferAttribute(TREES, 4);   // (x, z, scale, angle) source transforms
 const treeVisXform = new THREE.StorageBufferAttribute(TREES, 4);   // compacted transforms of visible trees
 const treeIndirect = new THREE.IndirectStorageBufferAttribute(new Uint32Array([treeGeo.index.count, 0, 0, 0, 0]), 1);
-// BUILDINGS — kept on the simple instanced + degenerate-cull path (focus is trees)
-const bldgPos = new THREE.StorageBufferAttribute(BLDGS, 4), bldgVis = new THREE.StorageBufferAttribute(BLDGS, 1);
+// BUILDINGS — same GPU-driven indirect-draw path as trees
+const bldgPos      = new THREE.StorageBufferAttribute(BLDGS, 4);   // (cx,cy,cz,radius) for the frustum test
+const bldgXform    = new THREE.StorageBufferAttribute(BLDGS, 4);   // (x, z, height, footprint) source transforms
+const bldgVisXform = new THREE.StorageBufferAttribute(BLDGS, 4);   // compacted transforms of visible buildings
+const bldgIndirect = new THREE.IndirectStorageBufferAttribute(new Uint32Array([bldgGeo.index.count, 0, 0, 0, 0]), 1);
 
 let treeMesh;
 if (isWebGPU) { treeMesh = new THREE.Mesh(treeGeo, treeMat); treeGeo.indirect = treeIndirect; }  // -> drawIndexedIndirect
 else          { treeMesh = new THREE.InstancedMesh(treeGeo, treeMat, TREES); }                    // WebGL2 baseline: draw all
 treeMesh.frustumCulled = false;
-const bldgs = new THREE.InstancedMesh(bldgGeo, bldgMat, BLDGS);
+treeMesh.castShadow = true; treeMesh.receiveShadow = true;   // depth pass reuses positionNode + rides the indirect count
+let bldgs;
+if (isWebGPU) { bldgs = new THREE.Mesh(bldgGeo, bldgMat); bldgGeo.indirect = bldgIndirect; }  // -> drawIndexedIndirect
+else          { bldgs = new THREE.InstancedMesh(bldgGeo, bldgMat, BLDGS); }                    // WebGL2 baseline: draw all
 bldgs.frustumCulled = false;
+bldgs.castShadow = true; bldgs.receiveShadow = true;
 
 // ── editable prop pools (port of the city demo, with compute-cull pos/vis buffer sync) ──
 const CW = WORLD / NT, tileWX = (i) => -HALF + (i + 0.5) * CW, propScale = Math.max(0.6, CW);
@@ -286,14 +311,18 @@ function placeTree(idx, tile, x, z, v) {
 }
 function placeBldg(idx, tile, x, z, v) {
   const hy = propScale * (1.0 + v*v*v*7.0), ft = propScale * 0.9;
-  dummy.position.set(x, 0, z); dummy.rotation.set(0, (Math.floor(v*4)) * 1.5708, 0); dummy.scale.set(ft, hy, ft); dummy.updateMatrix();
-  bldgs.setMatrixAt(idx, dummy.matrix);
-  bldgPos.array.set([x, hy*0.5, z, hy*0.6 + 3], idx*4); bldgVis.array[idx] = 1; bldgTileOf[idx] = tile;
+  bldgXform.array.set([x, z, hy, ft], idx*4);              // source transform for the (indirect) vertex stage
+  bldgPos.array.set([x, hy*0.5, z, hy*0.6 + 3], idx*4);    // bounding sphere for the frustum cull
+  bldgTileOf[idx] = tile;
+  if (!isWebGPU) {                                         // WebGL2 baseline also needs an instance matrix
+    dummy.position.set(x, 0, z); dummy.rotation.set(0, 0, 0); dummy.scale.set(ft, hy, ft); dummy.updateMatrix();
+    bldgs.setMatrixAt(idx, dummy.matrix);
+  }
 }
 function addProp(tile, type, x, z, v) {
   removeProp(tile);
   if (type === 1 && nTree < TREES) { const i = nTree++; placeTree(i, tile, x, z, v); propAt.set(tile, { layer: 0, idx: i }); uTreeCount.value = nTree; if (!isWebGPU) treeMesh.count = nTree; }
-  else if (type === 2 && nBldg < BLDGS) { const i = nBldg++; placeBldg(i, tile, x, z, v); propAt.set(tile, { layer: 1, idx: i }); bldgs.count = nBldg; }
+  else if (type === 2 && nBldg < BLDGS) { const i = nBldg++; placeBldg(i, tile, x, z, v); propAt.set(tile, { layer: 1, idx: i }); uBldgCount.value = nBldg; if (!isWebGPU) bldgs.count = nBldg; }
 }
 function removeProp(tile) {
   const e = propAt.get(tile); if (!e) return;
@@ -309,29 +338,32 @@ function removeProp(tile) {
   } else {
     const last = --nBldg;
     if (e.idx !== last) {
-      bldgs.getMatrixAt(last, dummy.matrix); bldgs.setMatrixAt(e.idx, dummy.matrix);
-      bldgPos.array.copyWithin(e.idx*4, last*4, last*4+4); bldgVis.array[e.idx] = bldgVis.array[last];
+      bldgXform.array.copyWithin(e.idx*4, last*4, last*4+4);
+      bldgPos.array.copyWithin(e.idx*4, last*4, last*4+4);
       const mt = bldgTileOf[last]; bldgTileOf[e.idx] = mt; propAt.get(mt).idx = e.idx;
+      if (!isWebGPU) { bldgs.getMatrixAt(last, dummy.matrix); bldgs.setMatrixAt(e.idx, dummy.matrix); }
     }
-    bldgs.count = nBldg;
+    uBldgCount.value = nBldg; if (!isWebGPU) bldgs.count = nBldg;
   }
   propAt.delete(tile);
 }
-{ // initial city fill
+{ // initial city fill — densities scale to the pools so large grids spread props evenly to capacity
   let seed = 1; const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
-  const cxg = NT/2, czg = NT/2, town = Math.round(NT*0.16);
+  const cxg = NT/2, czg = NT/2, town = Math.round(NT*0.16), townTiles = (2*town)*(2*town);
+  const pTree = Math.min(0.10, TREES / (NT*NT));                  // even tree scatter, capped to the pool budget
+  const pBldg = Math.min(0.6,  BLDGS / Math.max(1, townTiles));   // dense core, capped to the pool budget
   for (let z = 0; z < NT; z++) for (let x = 0; x < NT; x++) {
     const tile = z*NT + x;
     if (stateData[tile] >= ROAD0) continue;
     const wx = tileWX(x), wz = tileWX(z);
     if (Math.abs(x-cxg) < town && Math.abs(z-czg) < town) {
-      if (rnd() < 0.6) { stateData[tile] = ROCK0 + (rnd()*6|0); addProp(tile, 2, wx, wz, rnd()); }
-    } else if (rnd() < 0.10) { addProp(tile, 1, wx, wz, rnd()); }
+      if (rnd() < pBldg) { stateData[tile] = ROCK0 + (rnd()*6|0); addProp(tile, 2, wx, wz, rnd()); }
+    } else if (rnd() < pTree) { addProp(tile, 1, wx, wz, rnd()); }
   }
 }
-treePos.needsUpdate = true; treeXform.needsUpdate = true; bldgs.instanceMatrix.needsUpdate = true;
-if (!isWebGPU) treeMesh.instanceMatrix.needsUpdate = true;
-uTreeCount.value = nTree;
+treePos.needsUpdate = true; treeXform.needsUpdate = true; bldgPos.needsUpdate = true; bldgXform.needsUpdate = true;
+if (!isWebGPU) { treeMesh.instanceMatrix.needsUpdate = true; bldgs.instanceMatrix.needsUpdate = true; }
+uTreeCount.value = nTree; uBldgCount.value = nBldg;
 stateTex.needsUpdate = true;
 scene.add(treeMesh, bldgs);
 
@@ -339,7 +371,7 @@ scene.add(treeMesh, bldgs);
 const planeU = []; for (let i = 0; i < 6; i++) planeU.push(uniform(new THREE.Vector4()));
 const uCull = uniform(1);                       // 1 = culling active, 0 = draw everything
 const _frustum = new THREE.Frustum(), _vpm = new THREE.Matrix4();
-let treeReset = null, treeCull = null, bldgCull = null;
+let treeReset = null, treeCull = null, bldgReset = null, bldgCull = null;
 function updateFrustum() {
   camera.updateMatrixWorld();
   camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
@@ -374,16 +406,29 @@ if (isWebGPU) {
   treeMat.positionNode = vec3(sp.x.mul(ca).sub(sp.z.mul(sa)).add(d.x), sp.y, sp.x.mul(sa).add(sp.z.mul(ca)).add(d.y));
   treeMat.normalNode   = vec3(normalLocal.x.mul(ca).sub(normalLocal.z.mul(sa)), normalLocal.y, normalLocal.x.mul(sa).add(normalLocal.z.mul(ca)));
 
-  // ── BUILDINGS: unchanged degenerate-cull path ──
-  const bldgPosS = storage(bldgPos, 'vec4', BLDGS), bldgVisS = storage(bldgVis, 'float', BLDGS);
+  // ── BUILDINGS: same compute frustum cull -> atomic compaction -> drawIndexedIndirect ──
+  const bBoundS = storage(bldgPos, 'vec4', BLDGS);
+  const bXformS = storage(bldgXform, 'vec4', BLDGS);
+  const bVisXformS = storage(bldgVisXform, 'vec4', BLDGS);
+  const bIndS = storage(bldgIndirect, 'uint', 5).toAtomic();
+  bldgReset = Fn(() => { atomicStore(bIndS.element(1), uint(0)); })().compute(1);   // reset instanceCount each frame
   bldgCull = Fn(() => {
-    const p = bldgPosS.element(instanceIndex);
-    const vis = float(1).toVar();
-    const test = (pl) => If(pl.xyz.dot(p.xyz).add(pl.w).lessThan(p.w.negate()), () => { vis.assign(0); });
-    test(planeU[0]); test(planeU[1]); test(planeU[2]); test(planeU[3]); test(planeU[4]); test(planeU[5]);
-    bldgVisS.element(instanceIndex).assign(vis);
+    If(float(instanceIndex).lessThan(uBldgCount), () => {              // active buildings only
+      const p = bBoundS.element(instanceIndex);
+      const vis = float(1).toVar();
+      If(uCull.greaterThan(0.5), () => {                              // cull off -> all pass (A/B compare)
+        const test = (pl) => If(pl.xyz.dot(p.xyz).add(pl.w).lessThan(p.w.negate()), () => { vis.assign(0); });
+        test(planeU[0]); test(planeU[1]); test(planeU[2]); test(planeU[3]); test(planeU[4]); test(planeU[5]);
+      });
+      If(vis.greaterThan(0.5), () => {
+        const slot = atomicAdd(bIndS.element(1), uint(1));             // claim a draw slot
+        bVisXformS.element(slot).assign(bXformS.element(instanceIndex)); // compact this visible building's transform
+      });
+    });
   })().compute(BLDGS);
-  bldgMat.positionNode = positionLocal.mul(bldgVisS.element(instanceIndex).max(float(1).sub(uCull)));
+  // vertex stage rebuilds the world transform from the compacted buffer (translate ∘ non-uniform scale)
+  const bd = bVisXformS.element(instanceIndex);                        // (x, z, height, footprint)
+  bldgMat.positionNode = vec3(positionLocal.x.mul(bd.w).add(bd.x), positionLocal.y.mul(bd.z), positionLocal.z.mul(bd.w).add(bd.y));
 }
 
 // HUD
@@ -451,8 +496,8 @@ function paint(txc, tzc) {
   for (let z = z0; z < z1; z++) for (let x = x0; x < x1; x++) applyTool(x, z);
   stateTex.needsUpdate = true;
   treePos.needsUpdate = true; treeXform.needsUpdate = true;
-  bldgs.instanceMatrix.needsUpdate = true; bldgPos.needsUpdate = true; bldgVis.needsUpdate = true;
-  if (!isWebGPU) treeMesh.instanceMatrix.needsUpdate = true;
+  bldgPos.needsUpdate = true; bldgXform.needsUpdate = true;
+  if (!isWebGPU) { treeMesh.instanceMatrix.needsUpdate = true; bldgs.instanceMatrix.needsUpdate = true; }
   document.getElementById('inst').textContent = (nTree+nBldg).toLocaleString(); refreshPolyHud();
 }
 let downX = 0, downY = 0, moved = false;
@@ -480,7 +525,7 @@ sunBtn.onclick = () => setSun(!sunMoving);
 let stress = false;
 const stressBtn = document.getElementById('stressBtn');
 stressBtn.onclick = () => { stress = !stress; stressBtn.classList.toggle('on', stress); };
-function stressStep() { const k = (NT*NT*0.05)|0; for (let j = 0; j < k; j++) { const t = (Math.random()*NT*NT)|0; stateData[t] = (Math.random()*LAYERS)|0; } stateTex.needsUpdate = true; }
+function stressStep() { const k = Math.min((NT*NT*0.05)|0, 40000); for (let j = 0; j < k; j++) { const t = (Math.random()*NT*NT)|0; stateData[t] = (Math.random()*LAYERS)|0; } stateTex.needsUpdate = true; }
 
 window.addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
@@ -498,9 +543,8 @@ async function readVisible() {
   readPending = true;
   try {
     const ti = new Uint32Array(await renderer.getArrayBufferAsync(treeIndirect));   // [1] = visible tree count (GPU-written)
-    const bb = new Float32Array(await renderer.getArrayBufferAsync(bldgVis));
-    let c = ti[1]; for (let i = 0; i < nBldg; i++) c += bb[i];
-    visCount = c | 0;
+    const bi = new Uint32Array(await renderer.getArrayBufferAsync(bldgIndirect));   // [1] = visible building count
+    visCount = (ti[1] + bi[1]) | 0;
   } catch (e) { visCount = -2; } finally { readPending = false; }
 }
 
@@ -509,11 +553,10 @@ function animate() {
   if (stress) stressStep();
   if (sunMoving) { sunAngle += dt * 0.0004; sun.position.set(Math.cos(sunAngle)*SUN_R, SUN_H, Math.sin(sunAngle)*SUN_R); }
   controls.update();
-  if (isWebGPU) {                           // trees: always set the indirect instanceCount (uCull gates the test)
+  if (isWebGPU) {                           // trees + buildings: compute cull writes each indirect instanceCount (uCull gates the test)
     updateFrustum();
-    renderer.compute(treeReset);
-    renderer.compute(treeCull);
-    if (cullOn) renderer.compute(bldgCull); // buildings: degenerate-culled only when cull is on
+    renderer.compute(treeReset); renderer.compute(treeCull);
+    renderer.compute(bldgReset); renderer.compute(bldgCull);
   }
   renderer.render(scene, camera);
 
