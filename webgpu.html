@@ -54,6 +54,7 @@
     <div class="row"><span class="k">Draw calls</span><span id="calls" class="v">–</span></div>
     <div class="row"><span class="k">Instances</span><span id="inst" class="v">–</span></div>
     <div class="row"><span class="k">Drawn (visible)</span><span id="drawn" class="v">–</span></div>
+    <div class="row"><span class="k">Trees by LOD</span><span id="lod" class="v">–</span></div>
     <div class="row"><span class="k">Tree polys</span><span id="poly" class="v">–</span></div>
     <div class="row"><span class="k">Tree tris (total)</span><span id="polyTot" class="v">–</span></div>
     <div class="row"><span class="k">GPU cull</span><span id="cull" class="v">–</span></div>
@@ -71,6 +72,7 @@
     <div class="grp-label">COMPUTE CULLING</div>
     <div class="btns">
       <button id="cullBtn">GPU cull: on</button>
+      <button id="lodBtn">LOD: on</button>
     </div>
     <div class="grp-label">BUILD</div>
     <div class="btns" id="tools">
@@ -113,7 +115,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-import { Fn, instanceIndex, storage, uniform, float, positionLocal, If, texture, positionWorld, vec3, normalLocal, atomicAdd, atomicStore, uint } from 'three/tsl';
+import { Fn, instanceIndex, storage, uniform, float, positionLocal, If, texture, positionWorld, vec3, normalLocal, atomicAdd, atomicStore, uint, step } from 'three/tsl';
 
 const WORLD = 200, HALF = WORLD / 2;
 const TREES = 120000, BLDGS = 30000;
@@ -264,30 +266,46 @@ function buildTree(targetTris) {
   return g;
 }
 const treeTriangles = (g) => (g.index ? g.index.count : g.attributes.position.count) / 3;
-let treeGeo = buildTree(500), treeTris = treeTriangles(treeGeo);
+// ── tree level-of-detail: N geometry tiers (near→far), auto-selected per tree by camera distance ──
+const LOD_FRAC = [1.0, 0.25, 0.06];            // tier poly target as a fraction of the near (tier-0) count
+const LOD_DIST = [45, 110];                    // world-unit distance thresholds (N-1); 3 tiers keeps the compute
+                                               // within the 8-storage-buffer WebGPU limit (2 source + 3 vis + 3 indirect)
+const LOD_N = LOD_FRAC.length;
+const lodTarget = (i, near) => Math.max(24, Math.round(near * LOD_FRAC[i]));
+let treePolys = 500;
+const lodN = isWebGPU ? LOD_N : 1;             // WebGL2 has no compute -> a single full-detail mesh (no LOD)
+let treeGeos = Array.from({ length: lodN }, (_, i) => buildTree(lodTarget(i, treePolys)));
+let treeGeo = treeGeos[0], treeTris = treeTriangles(treeGeo);
 const bldgGeo = new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
 
-const treeMat = new THREE.MeshLambertNodeMaterial({ vertexColors: true });
+const treeMats = treeGeos.map(() => new THREE.MeshLambertNodeMaterial({ vertexColors: true }));
+const treeMat = treeMats[0];   // tier-0 material (also the WebGL2 InstancedMesh material)
 const bldgMat = new THREE.MeshLambertNodeMaterial({ color: 0x9a9c9f });
 const uTreeCount = uniform(0);
 const uBldgCount = uniform(0);
+const uLOD = uniform(1);                       // 1 = LOD on (distance tiers), 0 = all near-tier (full detail)
+const uCamPos = uniform(new THREE.Vector3());  // camera world position for the per-tree LOD distance test
 
 // TREES — GPU-driven indirect draw: bounding sphere + source transform + compacted-visible set + draw args
-const treePos      = new THREE.StorageBufferAttribute(TREES, 4);   // (cx,cy,cz,radius) for the frustum test
-const treeXform    = new THREE.StorageBufferAttribute(TREES, 4);   // (x, z, scale, angle) source transforms
-const treeVisXform = new THREE.StorageBufferAttribute(TREES, 4);   // compacted transforms of visible trees
-const treeIndirect = new THREE.IndirectStorageBufferAttribute(new Uint32Array([treeGeo.index.count, 0, 0, 0, 0]), 1);
+const treePos   = new THREE.StorageBufferAttribute(TREES, 4);   // (cx,cy,cz,radius) bounding sphere — shared across tiers
+const treeXform = new THREE.StorageBufferAttribute(TREES, 4);   // (x, z, scale, angle) source transforms — shared
+const treeVis = isWebGPU ? treeGeos.map(() => new THREE.StorageBufferAttribute(TREES, 4)) : [];   // compacted visible, per tier
+const treeInd = isWebGPU ? treeGeos.map((g) => new THREE.IndirectStorageBufferAttribute(new Uint32Array([g.index.count, 0, 0, 0, 0]), 1)) : [];
+const treeIndirect = treeInd[0];   // tier-0 indirect args (WebGL2: undefined, unused)
 // BUILDINGS — same GPU-driven indirect-draw path as trees
 const bldgPos      = new THREE.StorageBufferAttribute(BLDGS, 4);   // (cx,cy,cz,radius) for the frustum test
 const bldgXform    = new THREE.StorageBufferAttribute(BLDGS, 4);   // (x, z, height, footprint) source transforms
 const bldgVisXform = new THREE.StorageBufferAttribute(BLDGS, 4);   // compacted transforms of visible buildings
 const bldgIndirect = new THREE.IndirectStorageBufferAttribute(new Uint32Array([bldgGeo.index.count, 0, 0, 0, 0]), 1);
 
-let treeMesh;
-if (isWebGPU) { treeMesh = new THREE.Mesh(treeGeo, treeMat); treeGeo.indirect = treeIndirect; }  // -> drawIndexedIndirect
-else          { treeMesh = new THREE.InstancedMesh(treeGeo, treeMat, TREES); }                    // WebGL2 baseline: draw all
-treeMesh.frustumCulled = false;
-treeMesh.castShadow = true; treeMesh.receiveShadow = true;   // depth pass reuses positionNode + rides the indirect count
+let treeMeshes;
+if (isWebGPU) {                                   // one indirect-draw Mesh per LOD tier (each rides its own count)
+  treeMeshes = treeGeos.map((g, i) => { g.indirect = treeInd[i]; const m = new THREE.Mesh(g, treeMats[i]); m.frustumCulled = false; m.castShadow = true; m.receiveShadow = true; return m; });
+} else {                                          // WebGL2 baseline: a single full-detail InstancedMesh, draw all
+  const m = new THREE.InstancedMesh(treeGeo, treeMat, TREES); m.frustumCulled = false; m.castShadow = true; m.receiveShadow = true;
+  treeMeshes = [m];
+}
+const treeMesh = treeMeshes[0];                   // tier-0 reference for placement / poly-rebuild / HUD
 let bldgs;
 if (isWebGPU) { bldgs = new THREE.Mesh(bldgGeo, bldgMat); bldgGeo.indirect = bldgIndirect; }  // -> drawIndexedIndirect
 else          { bldgs = new THREE.InstancedMesh(bldgGeo, bldgMat, BLDGS); }                    // WebGL2 baseline: draw all
@@ -365,7 +383,7 @@ treePos.needsUpdate = true; treeXform.needsUpdate = true; bldgPos.needsUpdate = 
 if (!isWebGPU) { treeMesh.instanceMatrix.needsUpdate = true; bldgs.instanceMatrix.needsUpdate = true; }
 uTreeCount.value = nTree; uBldgCount.value = nBldg;
 stateTex.needsUpdate = true;
-scene.add(treeMesh, bldgs);
+scene.add(bldgs); for (const m of treeMeshes) scene.add(m);
 
 // ── GPU compute frustum cull (WebGPU backend only — WebGL2 has no compute/storage) ──────────
 const planeU = []; for (let i = 0; i < 6; i++) planeU.push(uniform(new THREE.Vector4()));
@@ -378,14 +396,15 @@ function updateFrustum() {
   _vpm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   _frustum.setFromProjectionMatrix(_vpm);
   for (let i = 0; i < 6; i++) { const p = _frustum.planes[i]; planeU[i].value.set(p.normal.x, p.normal.y, p.normal.z, p.constant); }
+  uCamPos.value.copy(camera.position);
 }
 if (isWebGPU) {
-  // ── TREES: compute frustum cull -> atomic compaction -> drawIndexedIndirect ──
+  // ── TREES: compute frustum cull -> per-tier distance bin -> atomic compaction -> one drawIndexedIndirect per tier ──
   const boundS = storage(treePos, 'vec4', TREES);
   const xformS = storage(treeXform, 'vec4', TREES);
-  const visXformS = storage(treeVisXform, 'vec4', TREES);
-  const indS = storage(treeIndirect, 'uint', 5).toAtomic();          // [indexCount, instanceCount, firstIndex, baseVertex, firstInstance]
-  treeReset = Fn(() => { atomicStore(indS.element(1), uint(0)); })().compute(1);   // reset instanceCount each frame
+  const visS = treeVis.map((b) => storage(b, 'vec4', TREES));                 // compacted visible, per tier
+  const indA = treeInd.map((b) => storage(b, 'uint', 5).toAtomic());          // [indexCount, instanceCount, ...] per tier
+  treeReset = Fn(() => { for (let i = 0; i < LOD_N; i++) atomicStore(indA[i].element(1), uint(0)); })().compute(1);
   treeCull = Fn(() => {
     If(float(instanceIndex).lessThan(uTreeCount), () => {              // active trees only
       const p = boundS.element(instanceIndex);
@@ -395,16 +414,26 @@ if (isWebGPU) {
         test(planeU[0]); test(planeU[1]); test(planeU[2]); test(planeU[3]); test(planeU[4]); test(planeU[5]);
       });
       If(vis.greaterThan(0.5), () => {
-        const slot = atomicAdd(indS.element(1), uint(1));             // claim a draw slot (returns the old count)
-        visXformS.element(slot).assign(xformS.element(instanceIndex)); // compact this visible tree's transform
+        const xf = xformS.element(instanceIndex);
+        const dist = p.xyz.sub(uCamPos).length();                    // tree's distance to the camera
+        const writeTier = (i) => { const slot = atomicAdd(indA[i].element(1), uint(1)); visS[i].element(slot).assign(xf); };
+        // per-tier membership as a 0/1 arithmetic expression (differences of step()s) — exclusive by construction.
+        // sFar(i) = 1 when the tree is beyond threshold i; ×uLOD so LOD-off collapses everyone to tier 0 (full detail).
+        const sFar = (i) => step(float(LOD_DIST[i]), dist).mul(uLOD);
+        const inBand = [float(1).sub(sFar(0))];                       // tier 0: nearest (full poly)
+        for (let k = 1; k < LOD_N - 1; k++) inBand.push(sFar(k - 1).sub(sFar(k)));   // middle bands
+        inBand.push(sFar(LOD_N - 2));                                 // farthest tier (lowest poly)
+        for (let k = 0; k < LOD_N; k++) If(inBand[k].greaterThan(0.5), () => { writeTier(k); });
       });
     });
   })().compute(TREES);
-  // vertex stage rebuilds the world transform from the compacted buffer (translate ∘ rotateY ∘ scale)
-  const d = visXformS.element(instanceIndex);                         // (x, z, scale, angle)
-  const ca = d.w.cos(), sa = d.w.sin(), sp = positionLocal.mul(d.z);
-  treeMat.positionNode = vec3(sp.x.mul(ca).sub(sp.z.mul(sa)).add(d.x), sp.y, sp.x.mul(sa).add(sp.z.mul(ca)).add(d.y));
-  treeMat.normalNode   = vec3(normalLocal.x.mul(ca).sub(normalLocal.z.mul(sa)), normalLocal.y, normalLocal.x.mul(sa).add(normalLocal.z.mul(ca)));
+  // each tier's vertex stage rebuilds the world transform from its compacted buffer (translate ∘ rotateY ∘ scale)
+  for (let i = 0; i < LOD_N; i++) {
+    const d = visS[i].element(instanceIndex);                         // (x, z, scale, angle)
+    const ca = d.w.cos(), sa = d.w.sin(), sp = positionLocal.mul(d.z);
+    treeMats[i].positionNode = vec3(sp.x.mul(ca).sub(sp.z.mul(sa)).add(d.x), sp.y, sp.x.mul(sa).add(sp.z.mul(ca)).add(d.y));
+    treeMats[i].normalNode   = vec3(normalLocal.x.mul(ca).sub(normalLocal.z.mul(sa)), normalLocal.y, normalLocal.x.mul(sa).add(normalLocal.z.mul(ca)));
+  }
 
   // ── BUILDINGS: same compute frustum cull -> atomic compaction -> drawIndexedIndirect ──
   const bBoundS = storage(bldgPos, 'vec4', BLDGS);
@@ -442,9 +471,13 @@ const elPoly = document.getElementById('poly'), elPolyTot = document.getElementB
 function refreshPolyHud() { elPoly.textContent = treeTris.toLocaleString(); elPolyTot.textContent = (treeTris * nTree).toLocaleString(); }
 function setTreePolys(target) {
   target = Math.max(24, Math.min(60000, target | 0));
-  const ng = buildTree(target); const old = treeMesh.geometry; treeMesh.geometry = ng; old.dispose();
-  if (isWebGPU) { ng.indirect = treeIndirect; treeIndirect.array[0] = ng.index.count; treeIndirect.needsUpdate = true; }
-  treeGeo = ng; treeTris = treeTriangles(ng); refreshPolyHud();
+  treePolys = target;
+  const ngs = treeMeshes.map((m, i) => {                                   // rebuild every tier from the new near count
+    const ng = buildTree(lodTarget(i, target)); const old = m.geometry; m.geometry = ng; old.dispose();
+    if (isWebGPU) { ng.indirect = treeInd[i]; treeInd[i].array[0] = ng.index.count; treeInd[i].needsUpdate = true; }
+    return ng;
+  });
+  treeGeos = ngs; treeGeo = ngs[0]; treeTris = treeTriangles(treeGeo); refreshPolyHud();
 }
 refreshPolyHud();
 const polyInput = document.getElementById('polyInput');
@@ -469,6 +502,17 @@ if (isWebGPU) {
 } else {
   cullOn = false; cullBtn.disabled = true; cullBtn.style.opacity = 0.5;
   cullBtn.textContent = 'GPU cull — WebGPU only'; elCullV.textContent = 'n/a (no compute)';
+}
+
+// LOD toggle: on -> trees bin into N tiers by camera distance; off -> all full-detail (tier 0)
+let lodOn = true;
+const lodBtn = document.getElementById('lodBtn');
+if (isWebGPU) {
+  const setLod = (on) => { lodOn = on; uLOD.value = on ? 1 : 0; lodBtn.classList.toggle('active', on); lodBtn.textContent = on ? 'LOD: on' : 'LOD: off'; };
+  lodBtn.onclick = () => setLod(!lodOn);
+  setLod(true);
+} else {
+  lodBtn.disabled = true; lodBtn.style.opacity = 0.5; lodBtn.textContent = 'LOD — WebGPU only';
 }
 
 // ── editing: pick (ray/plane) + paint tools + brushes ──
@@ -515,7 +559,7 @@ document.querySelectorAll('#scales button').forEach((b) => {
 // ── shadows toggle · moving sun · stress ──
 let shadows = true;
 const shadowBtn = document.getElementById('shadowBtn');
-function setShadows(on) { shadows = on; renderer.shadowMap.enabled = on; for (const m of [terrainMat, treeMat, bldgMat]) m.needsUpdate = true; shadowBtn.classList.toggle('active', on); shadowBtn.textContent = on ? 'shadows' : 'no shadows'; }
+function setShadows(on) { shadows = on; renderer.shadowMap.enabled = on; for (const m of [terrainMat, bldgMat, ...treeMats]) m.needsUpdate = true; shadowBtn.classList.toggle('active', on); shadowBtn.textContent = on ? 'shadows' : 'no shadows'; }
 shadowBtn.onclick = () => setShadows(!shadows);
 let sunMoving = false, sunAngle = Math.atan2(0.32, 0.5);
 const SUN_R = Math.hypot(0.5, 0.32) * WORLD, SUN_H = WORLD * 0.42;
@@ -533,18 +577,21 @@ window.addEventListener('resize', () => {
 });
 
 const elMs = document.getElementById('ms'), elFps = document.getElementById('fps'),
-      elCalls = document.getElementById('calls'), elDrawn = document.getElementById('drawn');
+      elCalls = document.getElementById('calls'), elDrawn = document.getElementById('drawn'), elLod = document.getElementById('lod');
 let prev = performance.now(), fpsSmooth = 0, gpuMs = 0, acc = 0, resolvePending = false;
 
 // read the visibility buffers back to count how many instances survive culling (proof + metric)
-let visCount = -1, readPending = false, readAcc = 0;
+let visCount = -1, lodCounts = [], readPending = false, readAcc = 0;
 async function readVisible() {
   if (readPending || !isWebGPU || typeof renderer.getArrayBufferAsync !== 'function') return;
   readPending = true;
   try {
-    const ti = new Uint32Array(await renderer.getArrayBufferAsync(treeIndirect));   // [1] = visible tree count (GPU-written)
-    const bi = new Uint32Array(await renderer.getArrayBufferAsync(bldgIndirect));   // [1] = visible building count
-    visCount = (ti[1] + bi[1]) | 0;
+    let treeTotal = 0; const lc = [];
+    for (let i = 0; i < treeInd.length; i++) {                                       // [1] = visible count for tier i
+      const a = new Uint32Array(await renderer.getArrayBufferAsync(treeInd[i])); lc.push(a[1]); treeTotal += a[1];
+    }
+    const bi = new Uint32Array(await renderer.getArrayBufferAsync(bldgIndirect));    // [1] = visible building count
+    lodCounts = lc; visCount = (treeTotal + bi[1]) | 0;
   } catch (e) { visCount = -2; } finally { readPending = false; }
 }
 
@@ -581,6 +628,10 @@ function animate() {
     elDrawn.textContent = !isWebGPU ? (nTree + nBldg).toLocaleString()
       : !cullOn ? (nTree + nBldg).toLocaleString() + ' (all)'
       : visCount >= 0 ? visCount.toLocaleString() : '…';
+    const fmtK = (c) => c >= 1000 ? (c/1000).toFixed(1) + 'k' : '' + c;
+    elLod.textContent = !isWebGPU ? 'n/a'
+      : !lodOn ? 'off (all near)'
+      : lodCounts.length ? lodCounts.map(fmtK).join(' · ') + '  (near→far)' : '…';
   }
 }
 renderer.setAnimationLoop(animate);
